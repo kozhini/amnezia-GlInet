@@ -85,9 +85,9 @@ jobs:
           
           # Add AmneziaWG packages to config
           cat >> .config << EOF
-          CONFIG_PACKAGE_kmod-amneziawg=y
-          CONFIG_PACKAGE_amneziawg-tools=y
-          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=m
+          CONFIG_PACKAGE_luci-proto-amneziawg=m
           EOF
           
           make defconfig
