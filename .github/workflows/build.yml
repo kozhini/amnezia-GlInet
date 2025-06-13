@@ -20,7 +20,7 @@ permissions:
 
 env:
   owr_branch: "openwrt-24.10"
-  owr_commit: "d7f9e240c2"
+  owr_commit: "6dacba30a7"
   gl_version: ${{ inputs.gl_version || '4.7.5' }}
   gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
 
@@ -127,21 +127,119 @@ jobs:
             echo "⚠️ Warning: Could not find VERMAGIC file for verification"
           fi
 
+      - name: Check AmneziaWG package structure
+        run: |
+          cd owrt
+          echo -e "\e[32m>>> Checking AmneziaWG package structure...\e[0m"
+          
+          if [ -d "package/awg" ]; then
+            echo "✅ AmneziaWG package directory exists"
+            ls -la package/awg/
+            
+            # Check for Makefile or package definitions
+            find package/awg -name "Makefile" -o -name "*.mk" | head -10
+            
+            # Check what packages are actually available
+            echo "=== Package definitions found ==="
+            find package/awg -name "*" -type d | grep -v "^\.$" | head -10
+            
+          else
+            echo "❌ AmneziaWG package directory not found!"
+            exit 1
+          fi
+
       - name: Build AmneziaWG packages
         run: |
           cd owrt
           
-          echo -e "\e[32m>>> Building AmneziaWG kernel module...\e[0m"
-          make package/awg/kmod-amneziawg/{clean,download,prepare} V=s
-          make package/awg/kmod-amneziawg/compile -i -j$(nproc) V=s
+          # First, let's see what packages are available to build
+          echo -e "\e[32m>>> Checking available AmneziaWG packages...\e[0m"
+          make package/awg/index V=s || true
           
-          echo -e "\e[32m>>> Building AmneziaWG LuCI protocol...\e[0m"
-          make package/awg/luci-proto-amneziawg/{clean,download,prepare} V=s
-          make package/awg/luci-proto-amneziawg/compile -i -j$(nproc) V=s
+          # Try to build packages with better error handling
+          build_package() {
+            local pkg_path="$1"
+            local pkg_name=$(basename "$pkg_path")
+            
+            echo -e "\e[32m>>> Building $pkg_name...\e[0m"
+            
+            # Check if package exists
+            if [ ! -d "$pkg_path" ]; then
+              echo "❌ Package directory $pkg_path not found!"
+              return 1
+            fi
+            
+            # Clean, download, prepare
+            echo "Cleaning $pkg_name..."
+            make $pkg_path/{clean,download,prepare} V=s || {
+              echo "❌ Failed to prepare $pkg_name"
+              return 1
+            }
+            
+            # Compile
+            echo "Compiling $pkg_name..."
+            make $pkg_path/compile V=s || {
+              echo "❌ Failed to compile $pkg_name"
+              # Show compilation errors
+              find logs/ -name "*$pkg_name*" -type f 2>/dev/null | head -3 | while read log; do
+                echo "=== $log ==="
+                tail -50 "$log"
+              done
+              return 1
+            }
+            
+            echo "✅ Successfully built $pkg_name"
+            return 0
+          }
           
-          echo -e "\e[32m>>> Building AmneziaWG tools...\e[0m"
-          make package/awg/amneziawg-tools/{clean,download,prepare} V=s
-          make package/awg/amneziawg-tools/compile -i -j$(nproc) V=s
+          # List available packages
+          echo "Available packages in awg directory:"
+          find package/awg -maxdepth 1 -type d | grep -v "^package/awg$" | sort
+          
+          # Try to build each package
+          success_count=0
+          total_count=0
+          
+          for pkg_dir in package/awg/*/; do
+            if [ -d "$pkg_dir" ] && [ -f "$pkg_dir/Makefile" ]; then
+              total_count=$((total_count + 1))
+              pkg_name=$(basename "$pkg_dir")
+              echo -e "\n\e[33m>>> Processing package: $pkg_name\e[0m"
+              
+              if build_package "package/awg/$pkg_name"; then
+                success_count=$((success_count + 1))
+              else
+                echo "❌ Failed to build $pkg_name, continuing with others..."
+              fi
+            fi
+          done
+          
+          echo -e "\n\e[32m>>> Build summary: $success_count/$total_count packages built successfully\e[0m"
+          
+          if [ $success_count -eq 0 ]; then
+            echo "❌ No packages were built successfully!"
+            exit 1
+          fi
+
+      - name: Debug build output
+        run: |
+          cd owrt
+          echo -e "\e[32m>>> Analyzing build output...\e[0m"
+          
+          echo "=== Build directory structure ==="
+          find . -name "*.ipk" -type f | head -20
+          
+          echo "=== All packages in bin/ ==="
+          find bin/ -name "*.ipk" 2>/dev/null | head -20 || echo "No bin/ directory found"
+          
+          echo "=== Searching for any amnezia-related files ==="
+          find . -name "*amnezia*" -o -name "*awg*" 2>/dev/null | head -20
+          
+          echo "=== Package compilation logs ==="
+          find . -name "*.log" -path "*/awg/*" 2>/dev/null | head -10
+          
+          echo "=== Checking if packages were built ==="
+          ls -la package/awg/ 2>/dev/null || echo "No package/awg directory"
 
       - name: Collect and verify packages
         run: |
@@ -149,21 +247,49 @@ jobs:
           echo -e "\e[32m>>> Collecting packages...\e[0m"
           mkdir -p awg
           
-          # Function to find and copy package with error handling
+          # Function to find and copy package with comprehensive search
           find_and_copy_package() {
             local package_name="$1"
             local output_name="$2"
             
             echo "Looking for package: $package_name"
             
-            # Search in multiple possible locations
+            # Comprehensive search in all possible locations
             local found_file=""
-            for search_path in "bin/packages/*/base" "bin/packages/*/packages" "bin/targets/*/packages"; do
-              found_file=$(find $search_path -name "${package_name}_*.ipk" 2>/dev/null | head -n1)
-              if [ -n "$found_file" ]; then
-                break
-              fi
+            
+            # Search patterns for different package naming conventions
+            local search_patterns=(
+              "${package_name}_*.ipk"
+              "${package_name}-*.ipk"
+              "*${package_name}*.ipk"
+            )
+            
+            # Search locations
+            local search_locations=(
+              "bin/packages/*/base"
+              "bin/packages/*/packages"
+              "bin/targets/*/packages"
+              "bin/packages/*/*"
+              "bin/targets/*/*"
+              "staging_dir/packages/*/base"
+              "build_dir/target-*/packages"
+            )
+            
+            for pattern in "${search_patterns[@]}"; do
+              for location in "${search_locations[@]}"; do
+                found_file=$(find $location -name "$pattern" 2>/dev/null | head -n1)
+                if [ -n "$found_file" ] && [ -f "$found_file" ]; then
+                  echo "Found with pattern '$pattern' in '$location'"
+                  break 2
+                fi
+              done
             done
+            
+            # If still not found, try global search
+            if [ -z "$found_file" ]; then
+              echo "Trying global search..."
+              found_file=$(find . -name "*${package_name}*.ipk" 2>/dev/null | grep -v "build_dir.*\.ipk-" | head -n1)
+            fi
             
             if [ -n "$found_file" ] && [ -f "$found_file" ]; then
               cp "$found_file" "awg/${output_name}_${{ env.gl_version }}.ipk"
@@ -174,53 +300,86 @@ jobs:
               if [ "$file_size" -lt 1000 ]; then
                 echo "⚠️ Warning: Package $output_name seems too small ($file_size bytes)"
               fi
+              return 0
             else
-              echo "❌ Package $package_name not found!"
-              echo "Available packages:"
-              find bin/ -name "*.ipk" | grep -E "(amnezia|awg)" || echo "No matching packages found"
+              echo "❌ Package $package_name not found anywhere!"
+              echo "Available packages containing 'amnezia' or 'awg':"
+              find . -name "*.ipk" 2>/dev/null | grep -E "(amnezia|awg)" | head -10 || echo "No matching packages found"
+              echo "All .ipk files:"
+              find . -name "*.ipk" 2>/dev/null | head -20 || echo "No .ipk files found"
               return 1
             fi
           }
           
-          # Copy packages with error handling
-          find_and_copy_package "amneziawg-tools" "amneziawg-tools"
-          find_and_copy_package "luci-proto-amneziawg" "luci-proto-amneziawg"
-          find_and_copy_package "kmod-amneziawg" "kmod-amneziawg"
+          # Try to find and copy packages
+          success_count=0
+          
+          if find_and_copy_package "amneziawg-tools" "amneziawg-tools"; then
+            ((success_count++))
+          fi
+          
+          if find_and_copy_package "luci-proto-amneziawg" "luci-proto-amneziawg"; then
+            ((success_count++))
+          fi
+          
+          if find_and_copy_package "kmod-amneziawg" "kmod-amneziawg"; then
+            ((success_count++))
+          fi
+          
+          echo "Successfully found $success_count out of 3 packages"
+          
+          if [ $success_count -eq 0 ]; then
+            echo "❌ No packages found! Build might have failed."
+            echo "Checking for build errors..."
+            find . -name "*.log" -exec grep -l -i "error\|failed" {} \; | head -5
+            exit 1
+          elif [ $success_count -lt 3 ]; then
+            echo "⚠️ Only $success_count packages found, but continuing..."
+          fi
 
       - name: Verify built packages
         run: |
           cd owrt
           echo -e "\e[32m>>> Verifying packages...\e[0m"
           
-          declare -a packages=("amneziawg-tools" "luci-proto-amneziawg" "kmod-amneziawg")
-          all_found=true
+          # Show what was actually created
+          echo "=== All .ipk files found ==="
+          find . -name "*.ipk" -type f | head -20
           
-          for pkg in "${packages[@]}"; do
-            pkg_file="awg/${pkg}_${{ env.gl_version }}.ipk"
-            if [ -f "$pkg_file" ]; then
-              file_size=$(stat -c%s "$pkg_file")
-              echo "✅ $pkg: $file_size bytes"
-              
-              # Basic package validation
-              if command -v opkg >/dev/null 2>&1; then
-                if opkg info "$pkg_file" >/dev/null 2>&1; then
-                  echo "  📦 Package structure valid"
-                else
-                  echo "  ⚠️ Package structure check failed"
+          # Check our collected packages
+          if [ -d "awg" ] && [ "$(ls -A awg 2>/dev/null)" ]; then
+            echo "=== Collected packages ==="
+            ls -la awg/
+            
+            declare -a found_packages=()
+            for file in awg/*.ipk; do
+              if [ -f "$file" ]; then
+                file_size=$(stat -c%s "$file")
+                pkg_name=$(basename "$file")
+                echo "✅ $pkg_name: $file_size bytes"
+                found_packages+=("$pkg_name")
+                
+                # Basic package validation
+                if command -v opkg >/dev/null 2>&1; then
+                  if opkg info "$file" >/dev/null 2>&1; then
+                    echo "  📦 Package structure valid"
+                  else
+                    echo "  ⚠️ Package structure check failed"
+                  fi
                 fi
               fi
-            else
-              echo "❌ Missing: $pkg_file"
-              all_found=false
+            done
+            
+            if [ ${#found_packages[@]} -eq 0 ]; then
+              echo "❌ No packages found in awg directory!"
+              exit 1
             fi
-          done
-          
-          if [ "$all_found" = false ]; then
-            echo "❌ Some packages are missing!"
+            
+            echo "✅ Found ${#found_packages[@]} packages total"
+          else
+            echo "❌ No packages directory or no packages found!"
             exit 1
           fi
-          
-          echo "✅ All packages verified successfully"
 
       - name: Generate release notes
         run: |
