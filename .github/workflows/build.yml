@@ -53,12 +53,12 @@ jobs:
 
           echo -e "\e[32m>>> Configuring...\e[0m"
           cp ../gl/config_${{ env.gl_version }}.buildinfo .config
-          echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
-          echo "CONFIG_PACKAGE_amneziawg-tools=m" >> .config
-          echo "CONFIG_PACKAGE_luci-proto-amneziawg=m" >> .config
-          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20=m" >> .config
-          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=m" >> .config
-          echo "CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=m" >> .config
+          echo "CONFIG_PACKAGE_kmod-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
+          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=y" >> .config
+          echo "CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=y" >> .config
           make defconfig
 
           echo -e "\e[1m\e[31m>>> Override VERMAGIC!\e[0m"
