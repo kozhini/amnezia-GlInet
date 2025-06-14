@@ -101,19 +101,24 @@ jobs:
             echo "❌ VERMAGIC file not found"; exit 1;
           fi
 
-      - name: Build AmneziaWG packages
+      - name: Build AmneziaWG Packages
         run: |
           cd owrt
           success=0
-          for dir in package/awg/*; do
-            [[ -f "$dir/Makefile" ]] || continue
-            pkg=$(basename "$dir")
-            echo "🔧 Building: $pkg"
-            make "package/awg/$pkg/{clean,download,prepare,compile}" V=s || echo "⚠️ $pkg failed to build"
-            [[ -f $(find bin/ -name "${pkg}_*.ipk" | head -n1) ]] && success=$((success + 1))
+          total=0
+          for pkg in package/awg/*/; do
+            [ -f "$pkg/Makefile" ] || continue
+            pkgname=$(basename "$pkg")
+            echo "🔧 Building: $pkgname"
+            make package/awg/${pkgname}/clean V=s || true
+            make package/awg/${pkgname}/download V=s || true
+            make package/awg/${pkgname}/prepare V=s || true
+            make package/awg/${pkgname}/compile V=s && success=$((success+1))
+            total=$((total+1))
           done
-          echo "✅ Total built: $success"
-          [[ $success -eq 0 ]] && exit 1
+          echo "✅ $success/$total packages built."
+          [ "$success" -gt 0 ] || exit 1
+
 
       - name: Collect packages
         run: |
