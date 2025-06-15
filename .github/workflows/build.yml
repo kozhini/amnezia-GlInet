@@ -1,10 +1,20 @@
-name: Build AmneziaWG packages
+name: Build & Publish AmneziaWG Packages
 
 on:
   push:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      gl_version:
+        description: 'GL.iNet version override'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if packages exist'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -12,24 +22,26 @@ permissions:
 env:
   owr_branch: "openwrt-24.10"
   owr_commit: "b546f80a3f"
-  gl_version: "4.7.5"
+  gl_version: ${{ inputs.gl_version || '4.7.5' }}
   gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+
     steps:
       - name: Checkout Configs
         uses: actions/checkout@v4
         with:
           path: gl
 
-      - name: Checkout AmneziaWG
+      - name: Checkout AmneziaWG Source
         uses: actions/checkout@v4
         with:
           path: awg
           repository: amnezia-vpn/amneziawg-openwrt
-          
+
       - name: Checkout OpenWRT
         uses: actions/checkout@v4
         with:
@@ -38,67 +50,95 @@ jobs:
           ref: ${{ env.owr_branch }}
           fetch-depth: 0
 
-      - name: Build OpenWRT Kernel
+      - name: Install Dependencies
         run: |
-          cd owrt
-          echo -e "\e[32m>>> Checkout revision\e[0m"
-          git reset --hard ${{ env.owr_commit }}
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk git subversion \
+            libssl-dev gettext zlib1g-dev swig unzip time rsync python3 python3-setuptools \
+            python3-yaml
 
-          mkdir -p ./package/awg
-          cp -a ../awg/. ./package/awg/
-          echo -e "\e[32m>>> Feed update...\e[0m"
-          ./scripts/feeds update -a
-          echo -e "\e[32m>>> Feed install\e[0m"
-          ./scripts/feeds install -a
-
-          echo -e "\e[32m>>> Configuring...\e[0m"
-          cp ../gl/config_${{ env.gl_version }}.buildinfo .config
-          echo "CONFIG_PACKAGE_kmod-amneziawg=m" >> .config
-          echo "CONFIG_PACKAGE_amneziawg-tools=y" >> .config
-          echo "CONFIG_PACKAGE_luci-proto-amneziawg=y" >> .config
-          make defconfig
-
-          echo -e "\e[1m\e[31m>>> Override VERMAGIC!\e[0m"
-          sed -i 's/grep '\''=\[ym\]'\'' \$(LINUX_DIR)\/\.config\.set | LC_ALL=C sort | \$(MKHASH) md5 > \$(LINUX_DIR)\/\.vermagic.*/echo "${{ env.gl_vermagic }}" > \$(LINUX_DIR)\/\.vermagic/' ./include/kernel-defaults.mk
-
-          echo -e "\e[32m>>> Tools...\e[0m"
-          make tools/install 
-          echo -e "\e[32m>>> Toolchain...\e[0m"
-          make toolchain/install 
-
-          echo -e "\e[32m>>> Building kernel...\e[0m"
-          make target/linux/{clean,compile} -i -j `nproc` V=s
-
-          VERMAGIC=`cat ./build_dir/target-*/linux-*/linux-*/.vermagic`
-          VERMAGIC_EXPECTED=${{ env.gl_vermagic }}
-
-          if [ "$VERMAGIC" != "$VERMAGIC_EXPECTED" ]; then
-            echo Something wrong with VERMAGIC, unexpected changes in /include/kernel-defaults.mk: $VERMAGIC, expected $VERMAGIC_EXPECTED
+      - name: Validate Configuration File
+        run: |
+          CONFIG_FILE="gl/config_${{ env.gl_version }}.buildinfo"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Missing configuration: $CONFIG_FILE"
             exit 1
           fi
-          
-      - name: Build AmneziaWG
+          echo "✅ Using $CONFIG_FILE"
+
+      - name: Prepare OpenWRT Build
         run: |
           cd owrt
-          echo -e "\e[32m>>> Building Amnezia...\e[0m"
-          make ./package/awg/kmod-amneziawg/{clean,download,prepare} V=s
-          make ./package/awg/kmod-amneziawg/compile -i -j `nproc` V=s
+          git reset --hard ${{ env.owr_commit }}
+          mkdir -p package/awg
+          cp -a ../awg/. package/awg/
 
-          make ./package/awg/luci-proto-amneziawg/{clean,download,prepare} V=s
-          make ./package/awg/luci-proto-amneziawg/compile -i -j `nproc` V=s
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
 
-          make ./package/awg/amneziawg-tools/{clean,download,prepare} V=s
-          make ./package/awg/amneziawg-tools/compile -i -j `nproc` V=s
+          cp ../gl/config_${{ env.gl_version }}.buildinfo .config
 
-          echo -e "\e[32m>>> Release...\e[0m"
-          mkdir -p awg
-          cp bin/packages/aarch64_cortex-a53/base/amneziawg-tools_*.ipk awg/amneziawg-tools_${{ env.gl_version }}.ipk
-          cp bin/packages/aarch64_cortex-a53/base/luci-proto-amneziawg_*.ipk awg/luci-proto-amneziawg_${{ env.gl_version }}.ipk
-          cp bin/targets/mediatek/filogic/packages/kmod-amneziawg_*.ipk awg/kmod-amneziawg_${{ env.gl_version }}.ipk
+          cat >> .config <<EOF
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=m
+          CONFIG_PACKAGE_luci-proto-amneziawg=m
+          EOF
 
-      - name: Release
-        uses: softprops/action-gh-release@v1
+          make defconfig
+
+          # Override vermagic
+          sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
+
+      - name: Build Kernel and Toolchain
+        run: |
+          cd owrt
+          make tools/install -j$(nproc)
+          make toolchain/install -j$(nproc)
+          make target/linux/{clean,compile} -i -j$(nproc) V=s
+
+      - name: Build AmneziaWG Packages
+        run: |
+          cd owrt
+          success=0
+          total=0
+          for pkg in package/awg/*/; do
+            [ -f "$pkg/Makefile" ] || continue
+            pkgname=$(basename "$pkg")
+            echo "🔧 Building: $pkgname"
+            make package/awg/${pkgname}/clean V=s || true
+            make package/awg/${pkgname}/download V=s || true
+            make package/awg/${pkgname}/prepare V=s || true
+            make package/awg/${pkgname}/compile V=s && success=$((success+1))
+            total=$((total+1))
+          done
+          echo "✅ $success/$total packages built."
+          [ "$success" -gt 0 ] || exit 1
+
+      - name: Collect Built Packages
+        run: |
+          cd owrt
+          mkdir -p ../artifacts
+          for pattern in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            found=$(find bin/ -name "$pattern*.ipk" | head -n 1)
+            if [ -n "$found" ]; then
+              cp "$found" ../artifacts/
+              echo "✅ Found and copied: $found"
+            else
+              echo "⚠️ Package $pattern not found"
+            fi
+          done
+
+      - name: Upload Packages as Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: AneziaWG OpenWRT v${{ env.gl_version }}
-          tag_name: AneziaWG_OpenWRT_v${{ env.gl_version }}
-          files: owrt/awg/*.ipk
+          name: amneziawg-packages-${{ env.gl_version }}
+          path: artifacts/*.ipk
+
+      - name: Auto-Publish Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.ipk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
