@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       gl_version:
-        description: 'GL.iNet version override'
+        description: 'GL.iNet version AmneziaWG'
         required: false
         type: string
       force_rebuild:
