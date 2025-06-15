@@ -50,6 +50,15 @@ jobs:
           ref: ${{ env.owr_branch }}
           fetch-depth: 0
 
+      # Кэширование системных зависимостей
+      - name: Cache APT packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt
+          key: apt-cache-${{ runner.os }}-${{ hashFiles('**/apt-requirements.txt') }}
+          restore-keys: |
+            apt-cache-${{ runner.os }}-
+
       - name: Install Dependencies
         run: |
           sudo apt-get update
@@ -57,11 +66,70 @@ jobs:
             libssl-dev gettext zlib1g-dev swig unzip time rsync python3 python3-setuptools \
             python3-yaml
 
+      # Многоуровневое кэширование OpenWRT
+      - name: Cache OpenWRT downloads
+        uses: actions/cache@v4
+        with:
+          path: owrt/dl
+          key: openwrt-dl-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ hashFiles('owrt/feeds.conf.default') }}
+          restore-keys: |
+            openwrt-dl-${{ env.owr_branch }}-${{ env.owr_commit }}-
+            openwrt-dl-${{ env.owr_branch }}-
+            openwrt-dl-
+
+      - name: Cache OpenWRT feeds
+        uses: actions/cache@v4
+        with:
+          path: |
+            owrt/feeds
+            owrt/package/feeds
+          key: openwrt-feeds-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ hashFiles('owrt/feeds.conf.default') }}
+          restore-keys: |
+            openwrt-feeds-${{ env.owr_branch }}-${{ env.owr_commit }}-
+            openwrt-feeds-${{ env.owr_branch }}-
+
+      - name: Cache OpenWRT staging
+        uses: actions/cache@v4
+        with:
+          path: owrt/staging_dir
+          key: openwrt-staging-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-${{ hashFiles('gl/config_*.buildinfo') }}
+          restore-keys: |
+            openwrt-staging-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-
+            openwrt-staging-${{ env.owr_branch }}-${{ env.owr_commit }}-
+            openwrt-staging-${{ env.owr_branch }}-
+
+      - name: Cache OpenWRT toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            owrt/build_dir/toolchain-*
+            owrt/build_dir/host
+          key: openwrt-toolchain-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-${{ hashFiles('gl/config_*.buildinfo') }}
+          restore-keys: |
+            openwrt-toolchain-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-
+            openwrt-toolchain-${{ env.owr_branch }}-${{ env.owr_commit }}-
+            openwrt-toolchain-${{ env.owr_branch }}-
+
+      # Кэширование собранных целей
+      - name: Cache OpenWRT build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            owrt/build_dir/target-*
+            owrt/tmp
+          key: openwrt-build-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-${{ env.gl_vermagic }}-${{ hashFiles('gl/config_*.buildinfo', 'awg/**') }}
+          restore-keys: |
+            openwrt-build-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-${{ env.gl_vermagic }}-
+            openwrt-build-${{ env.owr_branch }}-${{ env.owr_commit }}-${{ env.gl_version }}-
+            openwrt-build-${{ env.owr_branch }}-${{ env.owr_commit }}-
+
       - name: Validate Configuration File
         run: |
           CONFIG_FILE="gl/config_${{ env.gl_version }}.buildinfo"
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "❌ Missing configuration: $CONFIG_FILE"
+            echo "Available configs:"
+            ls -la gl/config_*.buildinfo || echo "No config files found"
             exit 1
           fi
           echo "✅ Using $CONFIG_FILE"
@@ -70,12 +138,24 @@ jobs:
         run: |
           cd owrt
           git reset --hard ${{ env.owr_commit }}
-          mkdir -p package/awg
+          
+          # Создаем директории если их нет
+          mkdir -p dl package/awg feeds staging_dir build_dir tmp
+          
+          # Копируем исходники AmneziaWG
           cp -a ../awg/. package/awg/
 
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          # Обновляем feeds только если кэш не найден
+          if [ ! -d "feeds/packages" ] || [ ! -d "feeds/luci" ]; then
+            echo "🔄 Updating feeds (cache miss)"
+            ./scripts/feeds update -a
+            ./scripts/feeds install -a
+          else
+            echo "✅ Using cached feeds"
+            ./scripts/feeds install -a
+          fi
 
+          # Применяем конфигурацию
           cp ../gl/config_${{ env.gl_version }}.buildinfo .config
 
           cat >> .config <<EOF
@@ -89,79 +169,154 @@ jobs:
           # Override vermagic
           sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
 
+      # Проверка состояния кэша
+      - name: Check build cache status
+        run: |
+          cd owrt
+          echo "📊 Build cache status:"
+          echo "• Downloads: $(du -sh dl 2>/dev/null || echo '0B')"
+          echo "• Feeds: $(du -sh feeds 2>/dev/null || echo '0B')"
+          echo "• Staging: $(du -sh staging_dir 2>/dev/null || echo '0B')"
+          echo "• Toolchain: $(du -sh build_dir/toolchain-* 2>/dev/null || echo '0B')"
+          echo "• Build artifacts: $(du -sh build_dir/target-* 2>/dev/null || echo '0B')"
+
       - name: Build Kernel and Toolchain
         run: |
           cd owrt
-          make tools/install -j$(nproc)
-          make toolchain/install -j$(nproc)
-          make target/linux/{clean,compile} -i -j$(nproc) V=s
+          
+          # Проверяем, есть ли уже собранный toolchain
+          if [ -f "staging_dir/toolchain-*/bin/mips-openwrt-linux-musl-gcc" ] || \
+             [ -f "staging_dir/toolchain-*/bin/aarch64-openwrt-linux-musl-gcc" ] || \
+             [ -f "staging_dir/toolchain-*/bin/arm-openwrt-linux-muslgnueabi-gcc" ]; then
+            echo "✅ Using cached toolchain"
+          else
+            echo "🔧 Building toolchain (cache miss)"
+            make tools/install -j$(nproc)
+            make toolchain/install -j$(nproc)
+          fi
+          
+          # Проверяем состояние ядра
+          if [ -d "build_dir/target-*/linux-*" ] && [ -f "build_dir/target-*/linux-*/.vermagic" ]; then
+            echo "✅ Using cached kernel build"
+          else
+            echo "🔧 Building kernel (cache miss)"
+            make target/linux/{clean,compile} -i -j$(nproc) V=s
+          fi
 
       - name: Build AmneziaWG Packages
         run: |
           cd owrt
           success=0
           total=0
+          
+          # Форсируем пересборку только AmneziaWG пакетов
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "🔄 Force rebuild requested"
+            make package/awg/{clean,download,prepare} V=s || true
+          fi
+          
           for pkg in package/awg/*/; do
             [ -f "$pkg/Makefile" ] || continue
             pkgname=$(basename "$pkg")
             echo "🔧 Building: $pkgname"
-            make package/awg/${pkgname}/clean V=s || true
-            make package/awg/${pkgname}/download V=s || true
-            make package/awg/${pkgname}/prepare V=s || true
-            make package/awg/${pkgname}/compile V=s && success=$((success+1))
+            
+            # Проверяем, есть ли уже собранный пакет
+            if find bin/ -name "$pkgname*.ipk" -newer "$pkg/Makefile" 2>/dev/null | grep -q .; then
+              echo "✅ Using cached package: $pkgname"
+              success=$((success+1))
+            else
+              echo "🔧 Building package: $pkgname (cache miss or outdated)"
+              make package/awg/${pkgname}/clean V=s || true
+              make package/awg/${pkgname}/download V=s || true
+              make package/awg/${pkgname}/prepare V=s || true
+              if make package/awg/${pkgname}/compile V=s; then
+                success=$((success+1))
+              fi
+            fi
             total=$((total+1))
           done
-          echo "✅ $success/$total packages built."
+          
+          echo "✅ $success/$total packages built/cached."
           [ "$success" -gt 0 ] || exit 1
 
       - name: Collect Built Packages
         run: |
           cd owrt
           mkdir -p ../artifacts
+          packages_found=0
+          
           for pattern in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
-            found=$(find bin/ -name "$pattern*.ipk" | head -n 1)
-            if [ -n "$found" ]; then
-              cp "$found" ../artifacts/
-              echo "✅ Found and copied: $found"
+            files=$(find bin/ -name "${pattern}*.ipk" 2>/dev/null || true)
+            if [ -n "$files" ]; then
+              echo "$files" | while read -r file; do
+                [ -f "$file" ] || continue
+                cp "$file" ../artifacts/
+                echo "✅ Copied: $(basename "$file")"
+                packages_found=$((packages_found + 1))
+              done
             else
-              echo "⚠️ Package $pattern not found"
+              echo "⚠️ Pattern $pattern not found"
             fi
           done
+          
+          # Проверяем наличие файлов
+          if [ -z "$(ls -A ../artifacts/ 2>/dev/null)" ]; then
+            echo "❌ No packages found to collect"
+            echo "Available packages:"
+            find bin/ -name "*.ipk" | head -20
+            exit 1
+          fi
+
       - name: Extract kernel info
-        id: kinfo        # <‑‑ нужен для outputs
+        id: kinfo
         run: |
           cd owrt
-          # Ищем .vermagic, лежит в каталоге с собранным ядром
-          VERMAGIC_FILE=$(find build_dir/target-*/linux-*/linux-*/.vermagic | head -n1)
+          # Добавляем таймаут ожидания файла
+          for i in {1..30}; do
+            VERMAGIC_FILE=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
+            [ -n "$VERMAGIC_FILE" ] && [ -f "$VERMAGIC_FILE" ] && break
+            echo "Waiting for .vermagic file... ($i/30)"
+            sleep 2
+          done
+          
           if [ ! -f "$VERMAGIC_FILE" ]; then
-            echo "❌ .vermagic not found"; exit 1
+            echo "❌ .vermagic not found after 60s timeout"
+            find build_dir/ -name ".vermagic" -ls 2>/dev/null || true
+            exit 1
           fi
 
           # Считываем VERMAGIC
           echo "vermagic=$(cat "$VERMAGIC_FILE")" >> "$GITHUB_OUTPUT"
 
-          # Получаем версию ядра через make kernelversion
+          # Получаем версию ядра
           KERNEL_DIR=$(dirname "$VERMAGIC_FILE")
-          KERNEL_VERSION=$(make -s -C "$KERNEL_DIR" kernelversion)
+          KERNEL_VERSION=$(make -s -C "$KERNEL_DIR" kernelversion 2>/dev/null || echo "unknown")
           echo "kernel_version=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Create release notes
         run: |
           cat > release_notes.md <<EOF
-          # AmneziaWG GL.iNet v${{ env.gl_version }}
-
-          ## Kernel information
-          • **Version** : ${{ steps.kinfo.outputs.kernel_version }}
-          • **VERMAGIC**: ${{ steps.kinfo.outputs.vermagic }}
-
-          ## Included packages
+          # AmneziaWG GL.iNet v${{ env.gl_version }}
+          
+          Built from OpenWRT ${{ env.owr_branch }} (commit: ${{ env.owr_commit }})
+          
+          ## Kernel Information
+          • **Version**: ${{ steps.kinfo.outputs.kernel_version }}
+          • **VERMAGIC**: ${{ steps.kinfo.outputs.vermagic }}
+          
+          ## Package Contents
           EOF
-
-          for f in artifacts/*.ipk; do
-            name=$(basename "$f")
-            size=$(stat -c%s "$f")
-            echo "• $name ($size bytes)" >> release_notes.md
-          done
+          
+          if [ -d artifacts ] && [ "$(ls -A artifacts/)" ]; then
+            for f in artifacts/*.ipk; do
+              [ -f "$f" ] || continue
+              name=$(basename "$f")
+              size=$(stat -c%s "$f" 2>/dev/null || echo "unknown")
+              echo "• \`$name\` ($size bytes)" >> release_notes.md
+            done
+          else
+            echo "⚠️ No packages found in artifacts/" >> release_notes.md
+          fi
 
       - name: Upload Packages as Artifact
         uses: actions/upload-artifact@v4
@@ -170,10 +325,23 @@ jobs:
           path: artifacts/*.ipk
 
       - name: Auto-Publish Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && hashFiles('artifacts/*.ipk') != ''
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.ipk
-          body_path: release_notes.md      # <‑‑ теперь явные заметки
+          body_path: release_notes.md
+          fail_on_unmatched_files: true
+          draft: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Показываем статистику кэша в конце
+      - name: Cache statistics
+        if: always()
+        run: |
+          echo "📊 Final cache statistics:"
+          echo "• Total downloads: $(du -sh owrt/dl 2>/dev/null || echo '0B')"
+          echo "• Feeds size: $(du -sh owrt/feeds 2>/dev/null || echo '0B')"
+          echo "• Staging dir: $(du -sh owrt/staging_dir 2>/dev/null || echo '0B')"
+          echo "• Build artifacts: $(du -sh owrt/build_dir 2>/dev/null || echo '0B')"
+          echo "• Artifacts created: $(ls -la artifacts/ 2>/dev/null | wc -l) files"
