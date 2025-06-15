@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  owr_branch: "openwrt-24.10"
+  owr_branch: "openwrt-24.10.1"
   gl_version: "4.7.5"
   gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
   kernel_version: "6.6.86"
