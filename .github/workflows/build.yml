@@ -127,6 +127,41 @@ jobs:
               echo "⚠️ Package $pattern not found"
             fi
           done
+      - name: Extract kernel info
+        id: kinfo        # <‑‑ нужен для outputs
+        run: |
+          cd owrt
+          # Ищем .vermagic, лежит в каталоге с собранным ядром
+          VERMAGIC_FILE=$(find build_dir/target-*/linux-*/linux-*/.vermagic | head -n1)
+          if [ ! -f "$VERMAGIC_FILE" ]; then
+            echo "❌ .vermagic not found"; exit 1
+          fi
+
+          # Считываем VERMAGIC
+          echo "vermagic=$(cat "$VERMAGIC_FILE")" >> "$GITHUB_OUTPUT"
+
+          # Получаем версию ядра через make kernelversion
+          KERNEL_DIR=$(dirname "$VERMAGIC_FILE")
+          KERNEL_VERSION=$(make -s -C "$KERNEL_DIR" kernelversion)
+          echo "kernel_version=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        run: |
+          cat > release_notes.md <<EOF
+          # AmneziaWG GL.iNet v${{ env.gl_version }}
+
+          ## Kernel information
+          • **Version** : ${{ steps.kinfo.outputs.kernel_version }}
+          • **VERMAGIC**: ${{ steps.kinfo.outputs.vermagic }}
+
+          ## Included packages
+          EOF
+
+          for f in artifacts/*.ipk; do
+            name=$(basename "$f")
+            size=$(stat -c%s "$f")
+            echo "• $name ($size bytes)" >> release_notes.md
+          done
 
       - name: Upload Packages as Artifact
         uses: actions/upload-artifact@v4
@@ -139,6 +174,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.ipk
-          generate_release_notes: true
+          body_path: release_notes.md      # <‑‑ теперь явные заметки
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
