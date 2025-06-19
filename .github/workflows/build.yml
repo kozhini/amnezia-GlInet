@@ -71,49 +71,130 @@ jobs:
       - name: Apply AmneziaWG Debug Fix Patch
         run: |
           cd awg
-          # Создаем патч для исправления проблемы с __dynamic_pr_debug
-          cat > fix-debug-symbols.patch <<'EOF'
-          --- a/src/compat/compat.h
-          +++ b/src/compat/compat.h
-          @@ -1,5 +1,15 @@
-           #ifndef _WG_COMPAT_H
-           #define _WG_COMPAT_H
-          +
-          +/* Fix for OpenWRT 24.10 dynamic debug symbols */
-          +#ifdef CONFIG_DYNAMIC_DEBUG
-          +#include <linux/dynamic_debug.h>
-          +#else
-          +#undef pr_debug
-          +#define pr_debug(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
-          +#endif
-          +
-          +#include <linux/printk.h>
-           
-           #include <linux/kconfig.h>
-           #include <linux/version.h>
-          EOF
+          echo "🔍 Exploring AmneziaWG project structure..."
+          find . -name "*.h" -o -name "*.c" | head -20
           
-          # Применяем патч если файл существует
-          if [ -f "src/compat/compat.h" ]; then
-            patch -p1 < fix-debug-symbols.patch || echo "Patch failed, continuing..."
-          else
-            echo "compat.h not found, creating minimal fix..."
-            mkdir -p src/compat
-            cat > src/compat/debug-fix.h <<'EOF'
-          #ifndef _AWG_DEBUG_FIX_H
-          #define _AWG_DEBUG_FIX_H
+          # Ищем все возможные файлы для патчинга
+          COMPAT_FILES=$(find . -name "compat.h" -o -name "compat-*.h" 2>/dev/null || true)
+          SOURCE_FILES=$(find . -name "*.c" -exec grep -l "pr_debug\|printk" {} \; 2>/dev/null | head -10 || true)
+          
+          echo "Found compat files: $COMPAT_FILES"
+          echo "Found source files with debug calls: $SOURCE_FILES"
+          
+          # Функция для применения фикса отладки
+          apply_debug_fix() {
+            local file="$1"
+            echo "🔧 Applying debug fix to: $file"
+            
+            # Создаем бэкап
+            cp "$file" "$file.bak"
+            
+            # Применяем фикс в начало файла
+            cat > "$file.tmp" <<'EOF'
+          /* AmneziaWG Debug Fix for OpenWRT 24.10 */
+          #ifndef _AWG_DEBUG_FIX_APPLIED
+          #define _AWG_DEBUG_FIX_APPLIED
           
           #include <linux/printk.h>
           
-          /* Disable dynamic debug for OpenWRT compatibility */
+          /* Replace dynamic debug with no-op for compatibility */
           #ifdef pr_debug
           #undef pr_debug
           #endif
-          #define pr_debug(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+          #define pr_debug(fmt, ...) no_printk(KERN_DEBUG fmt, ##__VA_ARGS__)
           
+          #ifdef dynamic_pr_debug
+          #undef dynamic_pr_debug
           #endif
+          #define dynamic_pr_debug(fmt, ...) no_printk(KERN_DEBUG fmt, ##__VA_ARGS__)
+          
+          #endif /* _AWG_DEBUG_FIX_APPLIED */
+          
           EOF
+            cat "$file" >> "$file.tmp"
+            mv "$file.tmp" "$file"
+            echo "✅ Applied debug fix to: $file"
+          }
+          
+          # Применяем фикс к найденным compat файлам
+          if [ -n "$COMPAT_FILES" ]; then
+            for file in $COMPAT_FILES; do
+              apply_debug_fix "$file"
+            done
+          else
+            echo "⚠️ No compat.h found, looking for main source files..."
+            
+            # Ищем основные исходные файлы
+            MAIN_FILES=$(find . -name "*.h" -path "*/src/*" -o -name "*.h" -path "*/kernel/*" 2>/dev/null | head -5)
+            if [ -n "$MAIN_FILES" ]; then
+              for file in $MAIN_FILES; do
+                if grep -q "linux/.*\.h\|#include" "$file" 2>/dev/null; then
+                  apply_debug_fix "$file"
+                  break
+                fi
+              done
+            fi
           fi
+          
+          # Создаем универсальный заголовочный файл фикса
+          echo "📝 Creating universal debug fix header..."
+          mkdir -p src/compat kernel/compat
+          
+          cat > debug-compat.h <<'EOF'
+          #ifndef _AMNEZIAWG_DEBUG_COMPAT_H
+          #define _AMNEZIAWG_DEBUG_COMPAT_H
+          
+          #include <linux/kernel.h>
+          #include <linux/printk.h>
+          
+          /* OpenWRT 24.10 Compatibility Layer */
+          #ifdef CONFIG_DYNAMIC_DEBUG
+          /* If dynamic debug is enabled, try to use it safely */
+          #ifndef KBUILD_MODNAME
+          #define KBUILD_MODNAME "amneziawg"
+          #endif
+          
+          #ifdef pr_debug
+          #undef pr_debug
+          #endif
+          #define pr_debug(fmt, ...) \
+              do { \
+                  if (0) \
+                      printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__); \
+              } while (0)
+          
+          #else
+          /* Fallback for systems without dynamic debug */
+          #ifdef pr_debug
+          #undef pr_debug
+          #endif
+          #define pr_debug(fmt, ...) no_printk(KERN_DEBUG fmt, ##__VA_ARGS__)
+          #endif
+          
+          /* Additional symbol compatibility */
+          #ifndef __dynamic_pr_debug
+          #define __dynamic_pr_debug(fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+          #endif
+          
+          #endif /* _AMNEZIAWG_DEBUG_COMPAT_H */
+          EOF
+          
+          # Копируем в разные возможные места
+          cp debug-compat.h src/compat/ 2>/dev/null || true
+          cp debug-compat.h kernel/compat/ 2>/dev/null || true
+          cp debug-compat.h . 2>/dev/null || true
+          
+          echo "✅ Debug compatibility layer created"
+          
+          # Модифицируем Makefile для включения нашего фикса
+          for makefile in $(find . -name "Makefile" -o -name "*.mk" | head -5); do
+            if grep -q "EXTRA_CFLAGS\|ccflags" "$makefile" 2>/dev/null; then
+              echo "🔧 Patching Makefile: $makefile"
+              sed -i.bak '/EXTRA_CFLAGS\|ccflags/a\\nEXTRA_CFLAGS += -include $(src)/debug-compat.h -Dpr_debug=no_printk' "$makefile" || true
+            fi
+          done
+          
+          echo "✅ AmneziaWG debug compatibility patches applied"
 
       - name: Prepare OpenWRT Build
         run: |
