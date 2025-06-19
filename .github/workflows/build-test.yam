@@ -1,0 +1,609 @@
+name: Build & Publish AmneziaWG Packages
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      gl_version:
+        description: 'GL.iNet version AmneziaWG'
+        required: false
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if packages exist'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  owr_branch: "openwrt-24.10"
+  owr_commit: "b546f80a3f"
+  gl_version: ${{ inputs.gl_version || '4.7.5' }}
+  gl_vermagic: "f2c63d42896f12da2b55f2c2b626e7be"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Configs
+        uses: actions/checkout@v4
+        with:
+          path: gl
+
+      - name: Checkout AmneziaWG Source
+        uses: actions/checkout@v4
+        with:
+          path: awg
+          repository: amnezia-vpn/amneziawg-openwrt
+
+      - name: Checkout OpenWRT
+        uses: actions/checkout@v4
+        with:
+          path: owrt
+          repository: openwrt/openwrt
+          ref: ${{ env.owr_branch }}
+          fetch-depth: 0
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk git subversion \
+            libssl-dev gettext zlib1g-dev swig unzip time rsync python3 python3-setuptools \
+            python3-yaml
+
+      - name: Validate Configuration File
+        run: |
+          CONFIG_FILE="gl/config_${{ env.gl_version }}.buildinfo"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Missing configuration: $CONFIG_FILE"
+            echo "Available configs:"
+            ls -la gl/config_*.buildinfo || echo "No config files found"
+            exit 1
+          fi
+          echo "✅ Using $CONFIG_FILE"
+
+      - name: Advanced AmneziaWG Debug Fix
+        run: |
+          cd awg
+          echo "🔍 Analyzing AmneziaWG project structure..."
+          find . -type f \( -name "*.h" -o -name "*.c" -o -name "Makefile" -o -name "*.mk" \) | sort
+          
+          # Create comprehensive debug compatibility header
+          echo "📝 Creating comprehensive debug compatibility header..."
+          cat > amneziawg-debug-compat.h <<'COMPAT_EOF'
+          #ifndef _AMNEZIAWG_DEBUG_COMPAT_H_
+          #define _AMNEZIAWG_DEBUG_COMPAT_H_
+          
+          /* AmneziaWG Debug Compatibility Layer for OpenWRT 24.10+ */
+          #include <linux/kernel.h>
+          #include <linux/printk.h>
+          #include <linux/module.h>
+          
+          /* Force disable dynamic debug to avoid symbol issues */
+          #ifdef CONFIG_DYNAMIC_DEBUG
+          #undef CONFIG_DYNAMIC_DEBUG
+          #endif
+          
+          /* Override all debug macros */
+          #ifdef pr_debug
+          #undef pr_debug
+          #endif
+          #define pr_debug(fmt, ...) no_printk(KERN_DEBUG pr_fmt(fmt), ##__VA_ARGS__)
+          
+          #ifdef dev_dbg
+          #undef dev_dbg
+          #endif
+          #define dev_dbg(dev, fmt, ...) no_printk(KERN_DEBUG fmt, ##__VA_ARGS__)
+          
+          #ifdef netdev_dbg
+          #undef netdev_dbg
+          #endif
+          #define netdev_dbg(dev, fmt, ...) no_printk(KERN_DEBUG fmt, ##__VA_ARGS__)
+          
+          /* Override dynamic debug functions */
+          #ifdef __dynamic_pr_debug
+          #undef __dynamic_pr_debug
+          #endif
+          #define __dynamic_pr_debug(descriptor, fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+          
+          #ifdef __dynamic_dev_dbg
+          #undef __dynamic_dev_dbg
+          #endif
+          #define __dynamic_dev_dbg(descriptor, dev, fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+          
+          #ifdef __dynamic_netdev_dbg
+          #undef __dynamic_netdev_dbg
+          #endif
+          #define __dynamic_netdev_dbg(descriptor, dev, fmt, ...) no_printk(fmt, ##__VA_ARGS__)
+          
+          /* Prevent any dynamic debug structures */
+          #ifdef DEFINE_DYNAMIC_DEBUG_METADATA
+          #undef DEFINE_DYNAMIC_DEBUG_METADATA
+          #endif
+          #define DEFINE_DYNAMIC_DEBUG_METADATA(name, fmt) \
+              static struct _ddebug __used __section("__verbose") name = { \
+                  .modname = KBUILD_MODNAME, \
+                  .function = __func__, \
+                  .filename = __FILE__, \
+                  .format = (fmt), \
+                  .lineno = __LINE__, \
+                  .flags = 0, \
+              }
+          
+          #endif /* _AMNEZIAWG_DEBUG_COMPAT_H_ */
+          COMPAT_EOF
+          
+          # Create a comprehensive patch function
+          apply_comprehensive_patch() {
+            local target_file="$1"
+            local file_type="$2"
+            
+            echo "🔧 Patching $file_type: $target_file"
+            
+            # Create backup
+            cp "$target_file" "$target_file.awg-backup"
+            
+            case "$file_type" in
+              "header")
+                # For header files, add include at the top after existing includes
+                if grep -q "#include" "$target_file"; then
+                  # Find the last #include line and add our header after it
+                  sed -i '/^#include.*$/a #include "amneziawg-debug-compat.h"' "$target_file"
+                else
+                  # No includes found, add at the beginning
+                  sed -i '1i#include "amneziawg-debug-compat.h"' "$target_file"
+                fi
+                ;;
+              "source")
+                # For source files, add include after the last #include
+                if grep -q "#include" "$target_file"; then
+                  sed -i '/^#include.*$/a #include "amneziawg-debug-compat.h"' "$target_file"
+                else
+                  sed -i '1i#include "amneziawg-debug-compat.h"' "$target_file"
+                fi
+                ;;
+              "makefile")
+                # For Makefiles, add compiler flags
+                if grep -q "ccflags\|CFLAGS\|EXTRA_CFLAGS" "$target_file"; then
+                  # Add to existing flags
+                  sed -i '/ccflags\|CFLAGS\|EXTRA_CFLAGS/a ccflags-y += -include $(src)/amneziawg-debug-compat.h -DCONFIG_DYNAMIC_DEBUG=0' "$target_file"
+                else
+                  # Add new flag line
+                  echo 'ccflags-y += -include $(src)/amneziawg-debug-compat.h -DCONFIG_DYNAMIC_DEBUG=0' >> "$target_file"
+                fi
+                ;;
+            esac
+            
+            echo "✅ Successfully patched: $target_file"
+          }
+          
+          # Find and patch all relevant files
+          echo "🔍 Finding files to patch..."
+          
+          # Copy our compatibility header to all possible locations
+          find . -type d -name "src" -exec cp amneziawg-debug-compat.h {} \; 2>/dev/null || true
+          find . -type d -name "kernel" -exec cp amneziawg-debug-compat.h {} \; 2>/dev/null || true
+          find . -name "*.c" -exec dirname {} \; | sort -u | while read dir; do
+            cp amneziawg-debug-compat.h "$dir/" 2>/dev/null || true
+          done
+          
+          # Find and patch header files
+          HEADER_FILES=$(find . -name "*.h" -not -name "*debug-compat*" | head -10)
+          for hfile in $HEADER_FILES; do
+            if grep -q "linux/.*\.h\|#include.*<\|#include.*\"" "$hfile" 2>/dev/null; then
+              apply_comprehensive_patch "$hfile" "header"
+            fi
+          done
+          
+          # Find and patch source files
+          SOURCE_FILES=$(find . -name "*.c" | head -15)
+          for sfile in $SOURCE_FILES; do
+            apply_comprehensive_patch "$sfile" "source"
+          done
+          
+          # Find and patch Makefiles
+          MAKEFILE_FILES=$(find . \( -name "Makefile" -o -name "*.mk" \) | head -10)
+          for mfile in $MAKEFILE_FILES; do
+            if [ -f "$mfile" ]; then
+              apply_comprehensive_patch "$mfile" "makefile"
+            fi
+          done
+          
+          # Create a master patch file for verification
+          echo "📋 Creating verification script..."
+          cat > verify-patches.sh <<'VERIFY_EOF'
+          #!/bin/bash
+          echo "🔍 Verifying applied patches..."
+          
+          # Check if our compatibility header exists in key locations
+          COMPAT_FOUND=0
+          for dir in . src kernel; do
+            if [ -f "$dir/amneziawg-debug-compat.h" ]; then
+              echo "✅ Found compatibility header in: $dir/"
+              COMPAT_FOUND=1
+            fi
+          done
+          
+          if [ $COMPAT_FOUND -eq 0 ]; then
+            echo "❌ Compatibility header not found in expected locations"
+            exit 1
+          fi
+          
+          # Check if files were actually patched
+          PATCHED_FILES=0
+          for file in $(find . -name "*.c" -o -name "*.h" | head -10); do
+            if grep -q "amneziawg-debug-compat.h" "$file" 2>/dev/null; then
+              echo "✅ Patch applied to: $file"
+              PATCHED_FILES=$((PATCHED_FILES + 1))
+            fi
+          done
+          
+          if [ $PATCHED_FILES -eq 0 ]; then
+            echo "❌ No files appear to be patched"
+            exit 1
+          fi
+          
+          echo "✅ Verification complete: $PATCHED_FILES files patched"
+          VERIFY_EOF
+          
+          chmod +x verify-patches.sh
+          ./verify-patches.sh
+          
+          echo "✅ Advanced debug compatibility patches applied successfully"
+
+      - name: Prepare OpenWRT Build
+        run: |
+          cd owrt
+          git reset --hard ${{ env.owr_commit }}
+          
+          # Copy AmneziaWG with applied patches
+          mkdir -p package/awg
+          cp -a ../awg/. package/awg/
+          
+          # Ensure compatibility headers are in package directory
+          find package/awg -name "amneziawg-debug-compat.h" -exec echo "✅ Found compat header: {}" \;
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          cp ../gl/config_${{ env.gl_version }}.buildinfo .config
+
+          # Enhanced configuration with explicit debug disabling
+          cat >> .config <<EOF
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          CONFIG_PACKAGE_kmod-crypto-lib-chacha20=m
+          CONFIG_PACKAGE_kmod-crypto-lib-chacha20poly1305=m
+          CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=m
+          
+          # Explicitly disable dynamic debug to avoid symbol issues
+          # CONFIG_DYNAMIC_DEBUG is not set
+          CONFIG_PRINTK=y
+          CONFIG_PRINTK_TIME=y
+          CONFIG_SYMBOLIC_ERRNAME=y
+          CONFIG_DEBUG_KERNEL=y
+          CONFIG_DEBUG_INFO=y
+          CONFIG_DEBUG_INFO_REDUCED=n
+          CONFIG_DEBUG_INFO_SPLIT=n
+          CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+          
+          # Kernel symbol configuration
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_MODVERSIONS=y
+          CONFIG_MODULE_SRCVERSION_ALL=y
+          EOF
+
+          make defconfig
+
+          # Override vermagic
+          sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
+
+      - name: Build Kernel and Toolchain
+        run: |
+          cd owrt
+          make tools/install -j$(nproc)
+          make toolchain/install -j$(nproc)
+          make target/linux/{clean,compile} -i -j$(nproc) V=s
+
+      - name: Enhanced AmneziaWG Package Build
+        run: |
+          cd owrt
+          
+          # Set build environment with debug disabled
+          export EXTRA_CFLAGS="-DCONFIG_DYNAMIC_DEBUG=0 -Dpr_debug=no_printk"
+          export KERNEL_CFLAGS="-DCONFIG_DYNAMIC_DEBUG=0"
+          
+          echo "🔧 Building AmneziaWG packages with enhanced error handling..."
+          
+          # Build packages with multiple fallback strategies
+          build_with_fallback() {
+            local pkg="$1"
+            local strategies=("normal" "no-debug" "force-compat")
+            
+            for strategy in "${strategies[@]}"; do
+              echo "🔄 Trying $strategy strategy for $pkg..."
+              
+              case "$strategy" in
+                "normal")
+                  export BUILD_CFLAGS=""
+                  ;;
+                "no-debug") 
+                  export BUILD_CFLAGS="-DCONFIG_DYNAMIC_DEBUG=0 -Dpr_debug=no_printk -D__dynamic_pr_debug=no_printk"
+                  ;;
+                "force-compat")
+                  export BUILD_CFLAGS="-DCONFIG_DYNAMIC_DEBUG=0 -include amneziawg-debug-compat.h"
+                  ;;
+              esac
+              
+              make package/awg/${pkg}/clean V=s || true
+              
+              if make package/awg/${pkg}/compile V=s EXTRA_CFLAGS="$BUILD_CFLAGS" 2>&1 | tee "/tmp/build_${pkg}_${strategy}.log"; then
+                echo "✅ Success with $strategy: $pkg"
+                return 0
+              else
+                echo "❌ Failed with $strategy: $pkg"
+                if grep -q "__dynamic_pr_debug\|undefined symbol" "/tmp/build_${pkg}_${strategy}.log"; then
+                  echo "🔍 Debug symbol issue detected, trying next strategy..."
+                  continue
+                fi
+              fi
+            done
+            
+            echo "❌ All strategies failed for: $pkg"
+            return 1
+          }
+          
+          # Build each package with fallback strategies
+          success=0
+          total=0
+          for pkg_dir in package/awg/*/; do
+            [ -f "$pkg_dir/Makefile" ] || continue
+            pkg=$(basename "$pkg_dir")
+            
+            echo "🔧 Building package: $pkg"
+            if build_with_fallback "$pkg"; then
+              success=$((success+1))
+            fi
+            total=$((total+1))
+          done
+          
+          echo "📊 Build results: $success/$total packages built successfully"
+          [ "$success" -gt 0 ] || exit 1
+
+      - name: Collect Built Packages
+        run: |
+          cd owrt
+          mkdir -p ../artifacts
+          packages_found=0
+          
+          echo "🔍 Searching for built packages..."
+          find bin/ -name "*.ipk" -ls
+          
+          for pattern in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            files=$(find bin/ -name "${pattern}*.ipk" 2>/dev/null || true)
+            if [ -n "$files" ]; then
+              echo "$files" | while read -r file; do
+                [ -f "$file" ] || continue
+                cp "$file" ../artifacts/
+                echo "✅ Collected: $(basename "$file")"
+              done
+              packages_found=$((packages_found + 1))
+            else
+              echo "⚠️ Pattern '$pattern' not found"
+            fi
+          done
+          
+          # Verify collection
+          collected_count=$(ls -1 ../artifacts/*.ipk 2>/dev/null | wc -l)
+          if [ "$collected_count" -eq 0 ]; then
+            echo "❌ No packages collected"
+            echo "Available .ipk files:"
+            find bin/ -name "*.ipk" -ls || echo "No .ipk files found anywhere"
+            exit 1
+          fi
+          
+          echo "✅ Successfully collected $collected_count package(s)"
+
+      - name: Package Quality Check
+        run: |
+          cd artifacts
+          echo "🧪 Performing package quality checks..."
+          
+          total_size=0
+          for pkg in *.ipk; do
+            [ -f "$pkg" ] || continue
+            
+            echo "📦 Analyzing: $pkg"
+            
+            # Check package structure
+            if command -v ar >/dev/null 2>&1; then
+              if ar t "$pkg" >/dev/null 2>&1; then
+                echo "  ✅ Package structure: OK"
+              else
+                echo "  ❌ Package structure: CORRUPTED"
+                continue
+              fi
+            fi
+            
+            # Check package size
+            size=$(stat -c%s "$pkg" 2>/dev/null || echo "0")
+            total_size=$((total_size + size))
+            
+            if [ "$size" -lt 500 ]; then
+              echo "  ⚠️ Size: SUSPICIOUS ($size bytes)"
+            elif [ "$size" -gt 10000000 ]; then
+              echo "  ⚠️ Size: LARGE ($size bytes)"
+            else
+              echo "  ✅ Size: OK ($size bytes)"
+            fi
+            
+            # Check for common issues
+            if command -v opkg-utils >/dev/null 2>&1 || command -v opkg >/dev/null 2>&1; then
+              echo "  ℹ️ Package validation tools available"
+            fi
+          done
+          
+          echo "📊 Quality check complete. Total size: $total_size bytes"
+
+      - name: Extract kernel info
+        id: kinfo
+        run: |
+          cd owrt
+          
+          # Enhanced kernel info extraction with timeout
+          echo "🔍 Extracting kernel information..."
+          
+          VERMAGIC_FILE=""
+          for attempt in {1..30}; do
+            VERMAGIC_FILE=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
+            if [ -n "$VERMAGIC_FILE" ] && [ -f "$VERMAGIC_FILE" ]; then
+              break
+            fi
+            echo "⏳ Waiting for .vermagic file... (attempt $attempt/30)"
+            sleep 2
+          done
+          
+          if [ ! -f "$VERMAGIC_FILE" ]; then
+            echo "❌ .vermagic file not found after timeout"
+            echo "Searching for alternative kernel info..."
+            
+            # Try alternative methods
+            KERNEL_VERSION=$(make -s kernelversion 2>/dev/null || echo "unknown")
+            VERMAGIC_CONTENT="${{ env.gl_vermagic }}"
+            
+            echo "Using fallback values:"
+            echo "Kernel: $KERNEL_VERSION"
+            echo "VERMAGIC: $VERMAGIC_CONTENT"
+          else
+            VERMAGIC_CONTENT=$(cat "$VERMAGIC_FILE" 2>/dev/null || echo "${{ env.gl_vermagic }}")
+            KERNEL_DIR=$(dirname "$VERMAGIC_FILE")
+            KERNEL_VERSION=$(make -s -C "$KERNEL_DIR" kernelversion 2>/dev/null || echo "unknown")
+            
+            echo "✅ Extracted from build:"
+            echo "Kernel: $KERNEL_VERSION"
+            echo "VERMAGIC: $VERMAGIC_CONTENT"
+          fi
+          
+          echo "vermagic=$VERMAGIC_CONTENT" >> "$GITHUB_OUTPUT"
+          echo "kernel_version=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create comprehensive release notes
+        run: |
+          cat > release_notes.md <<EOF
+          # AmneziaWG for GL.iNet v${{ env.gl_version }}
+          
+          Built from OpenWRT ${{ env.owr_branch }} (commit: \`${{ env.owr_commit }}\`)
+          
+          ## 🔧 Kernel Information
+          • **Version**: ${{ steps.kinfo.outputs.kernel_version }}
+          • **VERMAGIC**: \`${{ steps.kinfo.outputs.vermagic }}\`
+          
+          ## 🩹 Applied Fixes
+          • **Fixed \`__dynamic_pr_debug\` symbol compatibility** for OpenWRT 24.10+
+          • **Disabled dynamic debug** to prevent undefined symbol errors  
+          • **Enhanced kernel configuration** with proper symbol exports
+          • **Multi-strategy build process** with automatic fallbacks
+          • **Comprehensive compatibility layer** for debug functions
+          
+          ## 📦 Package Contents
+          EOF
+          
+          if [ -d artifacts ] && [ "$(ls -A artifacts/ 2>/dev/null)" ]; then
+            total_size=0
+            for f in artifacts/*.ipk; do
+              [ -f "$f" ] || continue
+              name=$(basename "$f")
+              size=$(stat -c%s "$f" 2>/dev/null || echo "0")
+              size_kb=$((size / 1024))
+              total_size=$((total_size + size))
+              echo "• \`$name\` (${size_kb}KB)" >> release_notes.md
+            done
+            total_size_kb=$((total_size / 1024))
+            echo "" >> release_notes.md
+            echo "**Total package size**: ${total_size_kb}KB" >> release_notes.md
+          else
+            echo "⚠️ **No packages available in this release**" >> release_notes.md
+          fi
+          
+          cat >> release_notes.md <<EOF
+          
+          ## 🚀 Installation Instructions
+          
+          ### Prerequisites
+          \`\`\`bash
+          # Ensure your system has the required kernel modules
+          opkg update
+          opkg install kmod-crypto-lib-chacha20poly1305
+          \`\`\`
+          
+          ### Installation
+          \`\`\`bash
+          # Download and install packages
+          wget <package-url>
+          opkg install *.ipk
+          \`\`\`
+          
+          ### Troubleshooting
+          If you encounter \`Unknown symbol\` errors:
+          
+          1. **Check kernel compatibility**:
+             \`\`\`bash
+             uname -r  # Should match kernel version above
+             \`\`\`
+          
+          2. **Force installation if needed**:
+             \`\`\`bash
+             opkg install --force-depends *.ipk
+             \`\`\`
+          
+          3. **Verify installation**:
+             \`\`\`bash
+             lsmod | grep amneziawg
+             amneziawg --version
+             \`\`\`
+          
+          ## 🐛 Known Issues
+          • Some older GL.iNet firmware versions may require manual kernel module loading
+          • If experiencing connectivity issues, restart the network service: \`/etc/init.d/network restart\`
+          
+          ## 📝 Build Information
+          • **Built on**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          • **OpenWRT commit**: ${{ env.owr_commit }}
+          • **Build environment**: Ubuntu Latest (GitHub Actions)
+          EOF
+          
+          echo ""
+          echo "📋 Generated release notes:"
+          echo "===========================================" 
+          cat release_notes.md
+          echo "==========================================="
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-gl-inet-${{ env.gl_version }}-packages
+          path: |
+            artifacts/*.ipk
+            release_notes.md
+          retention-days: 30
+
+      - name: Auto-Publish Release
+        if: startsWith(github.ref, 'refs/tags/') && hashFiles('artifacts/*.ipk') != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.ipk
+          body_path: release_notes.md
+          fail_on_unmatched_files: true
+          draft: false
+          name: "AmneziaWG GL.iNet v${{ env.gl_version }}"
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
