@@ -1,4 +1,4 @@
-# AmneziaWG Packages for offical GL.iNET MT-6000 router firmware
+# AmneziaWG Packages for offical GL.iNET router`s firmware
 
 
 Check kernel info and vermagic before installation
