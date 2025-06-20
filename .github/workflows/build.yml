@@ -22,8 +22,8 @@ permissions:
 env:
   owr_branch: "openwrt-24.10"
   owr_commit: "b546f80a3f"
-  gl_version: ${{ inputs.gl_version || '4.7.5' }}
-  gl_vermagic: "f2c63d42896f12da2b55f2c2b626e7be"
+  gl_version: ${{ inputs.gl_version || 'mt3000_4.7.5_op24' }}
+  gl_vermagic: "6ace983a14b769f576fe9c4c7961bd89"
 
 jobs:
   build:
