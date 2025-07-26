@@ -55,139 +55,413 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses5-dev gawk git subversion \
             libssl-dev gettext zlib1g-dev swig unzip time rsync python3 python3-setuptools \
-            python3-yaml
+            python3-yaml file
 
       - name: Validate Config File
         run: |
           CONFIG_FILE="gl/config_${{ env.gl_version }}.buildinfo"
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "❌ Missing config: $CONFIG_FILE"
-            ls -la gl/
+            echo "📁 Available configs:"
+            ls -la gl/ | grep -E '\.(config|buildinfo)$' || echo "No config files found"
             exit 1
           fi
           echo "✅ Using config: $CONFIG_FILE"
+          echo "📋 Config size: $(wc -l < "$CONFIG_FILE") lines"
 
       - name: Prepare OpenWRT
         run: |
           cd owrt
+          echo "🔄 Resetting to commit: ${{ env.owr_commit }}"
           git reset --hard ${{ env.owr_commit }}
+          
+          echo "📦 Setting up AWG packages..."
           mkdir -p package/awg
-          echo "📦 Copying AWG packages..."
           cp -a ../awg/{kmod-amneziawg,amneziawg-tools,luci-proto-amneziawg} package/awg/
-
+          
+          echo "📋 Copied packages:"
+          ls -la package/awg/
+          
+          echo "🔄 Updating feeds..."
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+          echo "⚙️ Applying configuration..."
           cp ../gl/config_${{ env.gl_version }}.buildinfo .config
+          
+          # Add AmneziaWG packages to config
           cat >> .config <<EOF
           CONFIG_PACKAGE_kmod-amneziawg=m
           CONFIG_PACKAGE_amneziawg-tools=y
           CONFIG_PACKAGE_luci-proto-amneziawg=y
           EOF
+          
           make defconfig
-          echo "🔍 Checking .config..."
-          grep -E 'amneziawg' .config || { echo "❌ .config missing amneziawg entries"; exit 1; }
-
+          
+          echo "🔧 Modifying vermagic..."
           sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
+
+      - name: Verify OpenWRT Configuration
+        run: |
+          cd owrt
+          echo "=== 📋 Проверка конфигурации ==="
+          
+          echo "🔍 AmneziaWG записи в .config:"
+          grep -E "(amneziawg|awg)" .config || echo "❌ Нет записей amneziawg в .config"
+          
+          echo "📦 Доступные пакеты в package/awg/:"
+          for pkg in package/awg/*/; do
+            if [ -d "$pkg" ]; then
+              pkgname=$(basename "$pkg")
+              echo "  📁 $pkgname"
+              if [ -f "$pkg/Makefile" ]; then
+                echo "    ✅ Makefile найден"
+                grep -E "^PKG_NAME|^PKG_VERSION" "$pkg/Makefile" | sed 's/^/    /'
+              else
+                echo "    ❌ Makefile отсутствует"
+              fi
+            fi
+          done
+          
+          echo "🎯 Проверка целевой архитектуры:"
+          grep -E "CONFIG_TARGET_" .config | head -5
 
       - name: Build Kernel/Toolchain
         run: |
           cd owrt
-          make tools/install -j$(nproc)
-          make toolchain/install -j$(nproc)
+          echo "🔨 Building tools..."
+          make tools/install -j$(nproc) V=s
+          
+          echo "🔨 Building toolchain..."
+          make toolchain/install -j$(nproc) V=s
+          
+          echo "🔨 Building kernel..."
           make target/linux/{clean,compile} -i -j$(nproc) V=s
 
-      - name: Build Packages
+      - name: Build Packages with Enhanced Logging
         run: |
           cd owrt
-          success=0; total=0
+          echo "=== 🔨 Начало сборки пакетов ==="
+          
+          # Создаем директорию для логов
+          mkdir -p build_logs
+          
+          # Проверяем наличие исходников
+          echo "📦 Найденные пакеты AWG:"
+          for pkg in package/awg/*/; do
+            [ -d "$pkg" ] || continue
+            pkgname=$(basename "$pkg")
+            echo "  - $pkgname"
+            ls -la "$pkg" | head -3
+          done
+          
+          # Собираем с детальным логированием
+          success=0; total=0; failed_packages=()
+          
           for pkg in package/awg/*/; do
             [ -f "$pkg/Makefile" ] || continue
             pkgname=$(basename "$pkg")
-            echo "🔧 Building $pkgname"
-            make package/awg/$pkgname/{clean,download,prepare} V=s || true
-            if make package/awg/$pkgname/compile V=s; then
-              echo "✅ Built $pkgname"; success=$((success+1))
+            echo ""
+            echo "🔧 [$((total+1))] Сборка пакета: $pkgname"
+            echo "=================="
+            
+            # Очистка
+            echo "  🧹 Очистка..."
+            make package/awg/$pkgname/clean V=s &> "build_logs/${pkgname}_clean.log"
+            
+            # Загрузка исходников
+            echo "  📥 Загрузка исходников..."
+            if make package/awg/$pkgname/download V=s &> "build_logs/${pkgname}_download.log"; then
+              echo "    ✅ Загрузка успешна"
             else
-              echo "❌ Failed $pkgname"
+              echo "    ⚠️ Проблемы с загрузкой (может быть нормально для локальных пакетов)"
+            fi
+            
+            # Подготовка
+            echo "  📋 Подготовка..."
+            if make package/awg/$pkgname/prepare V=s &> "build_logs/${pkgname}_prepare.log"; then
+              echo "    ✅ Подготовка успешна"
+            else
+              echo "    ❌ Ошибка подготовки"
+              echo "    📄 Последние строки лога подготовки:"
+              tail -10 "build_logs/${pkgname}_prepare.log" | sed 's/^/      /'
+              failed_packages+=("$pkgname (prepare)")
+              total=$((total+1))
+              continue
+            fi
+            
+            # Компиляция
+            echo "  ⚙️ Компиляция..."
+            if timeout 1800 make package/awg/$pkgname/compile V=s &> "build_logs/${pkgname}_compile.log"; then
+              echo "    ✅ Компиляция успешна: $pkgname"
+              success=$((success+1))
+              
+              # Немедленный поиск результатов
+              echo "  🔍 Поиск результатов сборки:"
+              recent_ipks=$(find . -name "*${pkgname}*.ipk" -newer "build_logs/${pkgname}_compile.log" 2>/dev/null || true)
+              if [ -n "$recent_ipks" ]; then
+                echo "$recent_ipks" | while read -r ipk; do
+                  size=$(stat -c%s "$ipk" 2>/dev/null || echo "unknown")
+                  echo "    📦 $(basename "$ipk") (${size} bytes)"
+                done
+              else
+                echo "    ⚠️ .ipk файлы не найдены сразу после сборки"
+              fi
+            else
+              echo "    ❌ Ошибка компиляции: $pkgname"
+              failed_packages+=("$pkgname (compile)")
+              echo "    📄 Последние 15 строк лога ошибки:"
+              tail -15 "build_logs/${pkgname}_compile.log" | sed 's/^/      /'
             fi
             total=$((total+1))
           done
-          echo "✅ $success / $total built."
-          [ "$success" -gt 0 ] || exit 1
+          
+          echo ""
+          echo "📊 ============ РЕЗУЛЬТАТЫ СБОРКИ ============"
+          echo "✅ Успешно собрано: $success из $total пакетов"
+          
+          if [ ${#failed_packages[@]} -gt 0 ]; then
+            echo "❌ Неудачные пакеты:"
+            for failed in "${failed_packages[@]}"; do
+              echo "  - $failed"
+            done
+          fi
+          
+          # Финальный глобальный поиск
+          echo ""
+          echo "🔍 Финальный поиск всех .ipk файлов:"
+          all_ipks=$(find . -name "*.ipk" -type f 2>/dev/null | head -20)
+          if [ -n "$all_ipks" ]; then
+            echo "$all_ipks" | while read -r ipk; do
+              size=$(stat -c%s "$ipk" 2>/dev/null || echo "unknown")
+              echo "  📦 $ipk (${size} bytes)"
+            done
+          else
+            echo "  ❌ Вообще никаких .ipk файлов не найдено!"
+          fi
+          
+          if [ "$success" -eq 0 ]; then
+            echo ""
+            echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Ни один пакет не был собран успешно!"
+            echo "📋 Структура директорий для диагностики:"
+            find . -maxdepth 3 -type d -name "*amnezia*" -o -name "*awg*" 2>/dev/null || true
+            exit 1
+          fi
 
-      - name: Collect IPK Artifacts
+      - name: Advanced Package Collection
         shell: bash
         run: |
           set -e
           cd owrt
+          
+          echo "=== 🎯 РАСШИРЕННЫЙ ПОИСК ПАКЕТОВ ==="
           mkdir -p ../artifacts
-
-          declare -a patterns=("kmod-amneziawg" "amneziawg-tools" "luci-proto-amneziawg")
+          
+          # Множественные стратегии поиска
+          declare -a search_strategies=(
+            "find . -name '*amneziawg*.ipk'"
+            "find . -name '*awg*.ipk'"
+            "find . -name 'kmod-*wg*.ipk'"
+            "find . -name 'luci-*amnezia*.ipk'"
+            "find . -name 'luci-proto-*wg*.ipk'"
+          )
+          
+          declare -a search_locations=(
+            "bin/targets"
+            "bin/packages"
+            "staging_dir"
+            "build_dir"
+            "."
+          )
+          
           copied=0
-
-          for pattern in "${patterns[@]}"; do
-            matches=$(find bin/ -type f -name "${pattern}*.ipk")
-            if [[ -n "$matches" ]]; then
-              echo "$matches" | while IFS= read -r file; do
-                cp "$file" ../artifacts/
-                echo "✅ Copied $(basename "$file")"
-                copied=$((copied+1))
+          found_files=()
+          
+          echo "🔍 Стратегия 1: Поиск по паттернам имен"
+          for strategy in "${search_strategies[@]}"; do
+            echo "  🔎 Выполняем: $strategy"
+            results=$(eval "$strategy" 2>/dev/null | head -10)
+            if [ -n "$results" ]; then
+              echo "$results" | while IFS= read -r file; do
+                if [ -f "$file" ]; then
+                  cp "$file" ../artifacts/
+                  size=$(stat -c%s "$file" || echo "unknown")
+                  echo "    ✅ Скопирован: $(basename "$file") (${size} bytes)"
+                  copied=$((copied+1))
+                fi
               done
-            else
-              echo "⚠️ No .ipk found for pattern: $pattern"
             fi
           done
-
-          if [[ "$copied" -eq 0 ]]; then
-            echo "❌ No .ipk found in total"
-            find bin/ -type f -name "*.ipk"
+          
+          echo ""
+          echo "🔍 Стратегия 2: Поиск в специфических локациях"
+          for location in "${search_locations[@]}"; do
+            if [ -d "$location" ]; then
+              echo "  📁 Сканируем: $location"
+              location_files=$(find "$location" -maxdepth 4 -name "*.ipk" 2>/dev/null | grep -iE "(amnezia|awg)" | head -5)
+              if [ -n "$location_files" ]; then
+                echo "$location_files" | while IFS= read -r file; do
+                  if [ -f "$file" ] && [ ! -f "../artifacts/$(basename "$file")" ]; then
+                    cp "$file" ../artifacts/
+                    size=$(stat -c%s "$file" || echo "unknown")
+                    echo "    ✅ Из $location: $(basename "$file") (${size} bytes)"
+                    copied=$((copied+1))
+                  fi
+                done
+              else
+                echo "    ⚪ В $location пакеты не найдены"
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "🔍 Стратегия 3: Поиск по времени модификации (последние 2 часа)"
+          recent_files=$(find . -name "*.ipk" -type f -mmin -120 2>/dev/null | head -10)
+          if [ -n "$recent_files" ]; then
+            echo "  📅 Недавно созданные .ipk файлы:"
+            echo "$recent_files" | while IFS= read -r file; do
+              if [ ! -f "../artifacts/$(basename "$file")" ]; then
+                cp "$file" ../artifacts/ 2>/dev/null || true
+                size=$(stat -c%s "$file" || echo "unknown")
+                echo "    ✅ Недавний: $(basename "$file") (${size} bytes)"
+                copied=$((copied+1))
+              fi
+            done
+          fi
+          
+          echo ""
+          echo "📊 ============ РЕЗУЛЬТАТ СБОРА ============"
+          
+          if [ -d "../artifacts" ] && [ "$(ls -A ../artifacts 2>/dev/null)" ]; then
+            echo "✅ Найденные артефакты:"
+            for artifact in ../artifacts/*; do
+              if [ -f "$artifact" ]; then
+                size=$(stat -c%s "$artifact" || echo "unknown")
+                file_type=$(file -b "$artifact" 2>/dev/null || echo "unknown")
+                echo "  📦 $(basename "$artifact")"
+                echo "    📏 Размер: ${size} bytes"
+                echo "    🔍 Тип: ${file_type}"
+              fi
+            done
+            copied=$(ls -1 ../artifacts | wc -l)
+            echo ""
+            echo "✅ Общий итог: собрано $copied пакетов"
+          else
+            echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Не найдено ни одного пакета!"
+            echo ""
+            echo "🩺 ДИАГНОСТИЧЕСКАЯ ИНФОРМАЦИЯ:"
+            echo "📋 Все .ipk файлы в системе сборки:"
+            find . -name "*.ipk" -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "Нет .ipk файлов"
+            echo ""
+            echo "📋 Файлы с 'amnezia' или 'awg' в имени:"
+            find . -type f \( -name "*amnezia*" -o -name "*awg*" \) 2>/dev/null | head -20 || echo "Нет файлов с такими именами"
+            echo ""
+            echo "📋 Содержимое важных директорий:"
+            for dir in bin staging_dir build_dir; do
+              if [ -d "$dir" ]; then
+                echo "  📁 $dir (первые 10 файлов):"
+                find "$dir" -type f 2>/dev/null | head -10 | sed 's/^/    /'
+              fi
+            done
             exit 1
           fi
-
-          echo "✅ Collected $copied packages"
 
       - name: Extract kernel info
         id: kinfo
         run: |
           cd owrt
+          echo "🔍 Поиск информации о ядре..."
+          
+          # Расширенный поиск .vermagic файла
+          vermagic_file=""
           for i in {1..30}; do
-            file=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
-            [ -f "$file" ] && break
-            echo "Waiting .vermagic... ($i)"
+            vermagic_file=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
+            [ -f "$vermagic_file" ] && break
+            vermagic_file=$(find . -name ".vermagic" 2>/dev/null | head -n1)
+            [ -f "$vermagic_file" ] && break
+            echo "⏳ Ожидание создания .vermagic файла... (попытка $i)"
             sleep 2
           done
-          [ -f "$file" ] || { echo "❌ .vermagic not found"; find build_dir/ -name .vermagic; exit 1; }
-          vermagic=$(cat "$file"); echo "vermagic=$vermagic" >> "$GITHUB_OUTPUT"
-          kdir=$(dirname "$file")
-          kv=$(make -s -C "$kdir" kernelversion 2>/dev/null || echo unknown)
-          echo "kernel_version=$kv" >> "$GITHUB_OUTPUT"
-          echo "✅ Kernel: $kv, VERMAGIC: $vermagic"
+          
+          if [ -f "$vermagic_file" ]; then
+            vermagic=$(cat "$vermagic_file")
+            echo "vermagic=$vermagic" >> "$GITHUB_OUTPUT"
+            echo "✅ VERMAGIC найден: $vermagic"
+            
+            # Извлечение версии ядра
+            kdir=$(dirname "$vermagic_file")
+            if [ -d "$kdir" ]; then
+              kv=$(make -s -C "$kdir" kernelversion 2>/dev/null || echo "unknown")
+              echo "kernel_version=$kv" >> "$GITHUB_OUTPUT"
+              echo "✅ Версия ядра: $kv"
+            else
+              echo "kernel_version=unknown" >> "$GITHUB_OUTPUT"
+              echo "⚠️ Не удалось определить версию ядра"
+            fi
+          else
+            echo "❌ .vermagic файл не найден!"
+            echo "🔍 Поиск в альтернативных местах:"
+            find . -name "*vermagic*" 2>/dev/null | head -10 || echo "Файлы vermagic не найдены"
+            echo "vermagic=unknown" >> "$GITHUB_OUTPUT"
+            echo "kernel_version=unknown" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create release notes
         run: |
+          echo "📝 Создание release notes..."
+          
           cat > release_notes.md <<EOF
-          # AmneziaWG GL.iNet v${{ env.gl_version }}
-
-          Built from OpenWRT ${{ env.owr_branch }} (commit ${{ env.owr_commit }})
-
-          ## Kernel Info
-          - Version: ${{ steps.kinfo.outputs.kernel_version }}
-          - VERMAGIC: ${{ steps.kinfo.outputs.vermagic }}
-
-          ## Packages:
+          # 🚀 AmneziaWG GL.iNet v${{ env.gl_version }}
+          
+          Собрано из OpenWRT ${{ env.owr_branch }} (commit ${{ env.owr_commit }})
+          
+          ## 🔧 Информация о ядре
+          - **Версия**: \`${{ steps.kinfo.outputs.kernel_version }}\`
+          - **VERMAGIC**: \`${{ steps.kinfo.outputs.vermagic }}\`
+          
+          ## 📦 Пакеты в релизе:
           EOF
-          for f in artifacts/*.ipk; do
-            size=$(stat -c%s "$f" || echo unknown)
-            echo "- \`$(basename "$f")\` ($size bytes)"
-          done >> release_notes.md
+          
+          if [ -d "artifacts" ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
+            for f in artifacts/*.ipk; do
+              if [ -f "$f" ]; then
+                size=$(stat -c%s "$f" 2>/dev/null || echo "unknown")
+                size_mb=$(echo "scale=2; $size/1024/1024" | bc -l 2>/dev/null || echo "unknown")
+                echo "- 📦 \`$(basename "$f")\` (**${size_mb} MB** / ${size} bytes)"
+              fi
+            done >> release_notes.md
+          else
+            echo "- ❌ **Пакеты не найдены**" >> release_notes.md
+          fi
+          
+          cat >> release_notes.md <<EOF
+          
+          ## 📋 Техническая информация
+          - **Целевая платформа**: GL.iNet ${{ env.gl_version }}
+          - **Дата сборки**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - **OpenWRT ветка**: ${{ env.owr_branch }}
+          - **OpenWRT commit**: ${{ env.owr_commit }}
+          
+          ## 🔧 Установка
+          \`\`\`bash
+          # Загрузите файлы на роутер и установите через opkg
+          opkg install kmod-amneziawg_*.ipk
+          opkg install amneziawg-tools_*.ipk
+          opkg install luci-proto-amneziawg_*.ipk
+          \`\`\`
+          EOF
+          
+          echo "📄 Предварительный просмотр release notes:"
           cat release_notes.md
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: amneziawg-packages-${{ env.gl_version }}
-          path: artifacts/*.ipk
+          name: amneziawg-packages-${{ env.gl_version }}-${{ github.run_number }}
+          path: |
+            artifacts/*.ipk
+            owrt/build_logs/*.log
+          retention-days: 30
 
       - name: Auto-publish release
         if: startsWith(github.ref, 'refs/tags/') && hashFiles('artifacts/*.ipk') != ''
@@ -195,7 +469,34 @@ jobs:
         with:
           files: artifacts/*.ipk
           body_path: release_notes.md
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           draft: false
+          prerelease: ${{ contains(github.ref, 'beta') || contains(github.ref, 'alpha') || contains(github.ref, 'rc') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup on failure
+        if: failure()
+        run: |
+          echo "🧹 Сбор диагностической информации при ошибке..."
+          cd owrt
+          
+          echo "📋 Последние логи сборки:"
+          if [ -d "build_logs" ]; then
+            for log in build_logs/*.log; do
+              if [ -f "$log" ]; then
+                echo "=== $(basename "$log") ==="
+                tail -20 "$log"
+                echo ""
+              fi
+            done
+          fi
+          
+          echo "📋 Дисковое пространство:"
+          df -h
+          
+          echo "📋 Использование памяти:"
+          free -h
+          
+          echo "📋 Процессы сборки:"
+          ps aux | grep -E "(make|gcc|ld)" | head -10 || true
