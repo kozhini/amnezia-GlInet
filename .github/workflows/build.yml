@@ -260,10 +260,15 @@ jobs:
           # Множественные стратегии поиска
           declare -a search_strategies=(
             "find . -name '*amneziawg*.ipk'"
+            "find . -name '*amneziawg*.apk'"
             "find . -name '*awg*.ipk'"
+            "find . -name '*awg*.apk'"
             "find . -name 'kmod-*wg*.ipk'"
+            "find . -name 'kmod-*wg*.apk'"
             "find . -name 'luci-*amnezia*.ipk'"
+            "find . -name 'luci-*amnezia*.apk'"
             "find . -name 'luci-proto-*wg*.ipk'"
+            "find . -name 'luci-proto-*wg*.apk'"
           )
           
           declare -a search_locations=(
@@ -298,7 +303,7 @@ jobs:
           for location in "${search_locations[@]}"; do
             if [ -d "$location" ]; then
               echo "  📁 Сканируем: $location"
-              location_files=$(find "$location" -maxdepth 4 -name "*.ipk" 2>/dev/null | grep -iE "(amnezia|awg)" | head -5)
+              location_files=$(find "$location" -maxdepth 4 \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null | grep -iE "(amnezia|awg)" | head -5)
               if [ -n "$location_files" ]; then
                 echo "$location_files" | while IFS= read -r file; do
                   if [ -f "$file" ] && [ ! -f "../artifacts/$(basename "$file")" ]; then
@@ -316,7 +321,7 @@ jobs:
           
           echo ""
           echo "🔍 Стратегия 3: Поиск по времени модификации (последние 2 часа)"
-          recent_files=$(find . -name "*.ipk" -type f -mmin -120 2>/dev/null | head -10)
+          recent_files=$(find . \( -name "*.ipk" -o -name "*.apk" \) -type f -mmin -120 2>/dev/null | head -10)
           if [ -n "$recent_files" ]; then
             echo "  📅 Недавно созданные .ipk файлы:"
             echo "$recent_files" | while IFS= read -r file; do
@@ -350,8 +355,8 @@ jobs:
             echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Не найдено ни одного пакета!"
             echo ""
             echo "🩺 ДИАГНОСТИЧЕСКАЯ ИНФОРМАЦИЯ:"
-            echo "📋 Все .ipk файлы в системе сборки:"
-            find . -name "*.ipk" -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "Нет .ipk файлов"
+            echo "📋 Все .ipk и .apk файлы в системе сборки:"
+            find . \( -name "*.ipk" -o -name "*.apk" \) -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "Нет .ipk/.apk файлов"
             echo ""
             echo "📋 Файлы с 'amnezia' или 'awg' в имени:"
             find . -type f \( -name "*amnezia*" -o -name "*awg*" \) 2>/dev/null | head -20 || echo "Нет файлов с такими именами"
@@ -460,14 +465,17 @@ jobs:
           name: amneziawg-packages-${{ env.gl_version }}-${{ github.run_number }}
           path: |
             artifacts/*.ipk
+            artifacts/*.apk
             owrt/build_logs/*.log
           retention-days: 30
 
       - name: Auto-publish release
-        if: startsWith(github.ref, 'refs/tags/') && hashFiles('artifacts/*.ipk') != ''
+        if: startsWith(github.ref, 'refs/tags/') && (hashFiles('artifacts/*.ipk') != '' || hashFiles('artifacts/*.apk') != '')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*.ipk
+          files: |
+            artifacts/*.ipk
+            artifacts/*.apk
           body_path: release_notes.md
           fail_on_unmatched_files: false
           draft: false
