@@ -152,16 +152,16 @@ jobs:
       - name: Create release notes
         run: |
           cat > release_notes.md <<EOF
-# AmneziaWG GL.iNet v${{ env.gl_version }}
+          # AmneziaWG GL.iNet v${{ env.gl_version }}
 
-Built from OpenWRT ${{ env.owr_branch }} (commit ${{ env.owr_commit }})
+          Built from OpenWRT ${{ env.owr_branch }} (commit ${{ env.owr_commit }})
 
-## Kernel Info
-- Version: ${{ steps.kinfo.outputs.kernel_version }}
-- VERMAGIC: ${{ steps.kinfo.outputs.vermagic }}
+          ## Kernel Info
+          - Version: ${{ steps.kinfo.outputs.kernel_version }}
+          - VERMAGIC: ${{ steps.kinfo.outputs.vermagic }}
 
-## Packages:
-EOF
+          ## Packages:
+          EOF
           for f in artifacts/*.ipk; do
             size=$(stat -c%s "$f" || echo unknown)
             echo "- \`$(basename "$f")\` ($size bytes)"
