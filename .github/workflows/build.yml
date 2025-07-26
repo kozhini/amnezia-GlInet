@@ -101,6 +101,47 @@ jobs:
           echo "🔧 Modifying vermagic..."
           sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
 
+      - name: Check Package Manager Type
+        run: |
+          cd owrt
+          echo "🔍 Проверка типа пакетного менеджера..."
+          
+          # Проверяем конфигурацию на APK
+          if grep -q "CONFIG_USE_APK" .config 2>/dev/null; then
+            echo "📦 Система настроена на APK пакеты"
+            echo "package_format=apk" >> $GITHUB_ENV
+            echo "PACKAGE_EXT=apk" >> $GITHUB_ENV
+          else
+            echo "📦 Система настроена на IPK пакеты (по умолчанию)"
+            echo "package_format=ipk" >> $GITHUB_ENV
+            echo "PACKAGE_EXT=ipk" >> $GITHUB_ENV
+          fi
+          
+          echo "🔍 Анализ настроек пакетного менеджера:"
+          echo "  📋 APK-related конфигурация:"
+          grep -iE "apk" .config | head -5 || echo "    Нет APK настроек"
+          
+          echo "  📋 OPKG-related конфигурация:"
+          grep -iE "opkg" .config | head -5 || echo "    Нет OPKG настроек"
+          
+          echo "  📋 Package manager настройки:"
+          grep -iE "(package.*manager|CONFIG_USE_)" .config | head -5 || echo "    Стандартные настройки"
+          
+          echo "🔍 Проверка версии OpenWRT и коммита:"
+          echo "  📅 Ветка: ${{ env.owr_branch }}"
+          echo "  🔗 Коммит: ${{ env.owr_commit }}"
+          
+          # Проверяем дату коммита для понимания, когда был переход
+          commit_date=$(git show -s --format=%ci ${{ env.owr_commit }} 2>/dev/null || echo "unknown")
+          echo "  📅 Дата коммита: $commit_date"
+          
+          # Проверяем наличие APK утилит в системе сборки
+          echo "🔍 Доступные пакетные менеджеры в сборочной системе:"
+          which apk 2>/dev/null && echo "  ✅ APK доступен" || echo "  ❌ APK недоступен"
+          which opkg 2>/dev/null && echo "  ✅ OPKG доступен" || echo "  ❌ OPKG недоступен"
+          
+          echo "🎯 Итоговый формат пакетов: ${{ env.PACKAGE_EXT || 'ipk' }}"
+
       - name: Verify OpenWRT Configuration
         run: |
           cd owrt
@@ -198,14 +239,16 @@ jobs:
               
               # Немедленный поиск результатов
               echo "  🔍 Поиск результатов сборки:"
-              recent_ipks=$(find . -name "*${pkgname}*.ipk" -newer "build_logs/${pkgname}_compile.log" 2>/dev/null || true)
+              # Поиск как .ipk, так и .apk файлов
+              recent_ipks=$(find . \( -name "*${pkgname}*.ipk" -o -name "*${pkgname}*.apk" \) -newer "build_logs/${pkgname}_compile.log" 2>/dev/null || true)
               if [ -n "$recent_ipks" ]; then
-                echo "$recent_ipks" | while read -r ipk; do
-                  size=$(stat -c%s "$ipk" 2>/dev/null || echo "unknown")
-                  echo "    📦 $(basename "$ipk") (${size} bytes)"
+                echo "$recent_ipks" | while read -r pkg_file; do
+                  size=$(stat -c%s "$pkg_file" 2>/dev/null || echo "unknown")
+                  pkg_ext="${pkg_file##*.}"
+                  echo "    📦 $(basename "$pkg_file") [${pkg_ext}] (${size} bytes)"
                 done
               else
-                echo "    ⚠️ .ipk файлы не найдены сразу после сборки"
+                echo "    ⚠️ Пакеты не найдены сразу после сборки"
               fi
             else
               echo "    ❌ Ошибка компиляции: $pkgname"
@@ -229,15 +272,16 @@ jobs:
           
           # Финальный глобальный поиск
           echo ""
-          echo "🔍 Финальный поиск всех .ipk файлов:"
-          all_ipks=$(find . -name "*.ipk" -type f 2>/dev/null | head -20)
-          if [ -n "$all_ipks" ]; then
-            echo "$all_ipks" | while read -r ipk; do
-              size=$(stat -c%s "$ipk" 2>/dev/null || echo "unknown")
-              echo "  📦 $ipk (${size} bytes)"
+          echo "🔍 Финальный поиск всех пакетных файлов:"
+          all_packages=$(find . \( -name "*.ipk" -o -name "*.apk" \) -type f 2>/dev/null | head -20)
+          if [ -n "$all_packages" ]; then
+            echo "$all_packages" | while read -r pkg_file; do
+              size=$(stat -c%s "$pkg_file" 2>/dev/null || echo "unknown")
+              pkg_ext="${pkg_file##*.}"
+              echo "  📦 $pkg_file [${pkg_ext}] (${size} bytes)"
             done
           else
-            echo "  ❌ Вообще никаких .ipk файлов не найдено!"
+            echo "  ❌ Вообще никаких пакетных файлов не найдено!"
           fi
           
           if [ "$success" -eq 0 ]; then
@@ -245,6 +289,9 @@ jobs:
             echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Ни один пакет не был собран успешно!"
             echo "📋 Структура директорий для диагностики:"
             find . -maxdepth 3 -type d -name "*amnezia*" -o -name "*awg*" 2>/dev/null || true
+            echo "📋 Проверка формата пакетов в системе:"
+            echo "  🎯 Ожидаемый формат: ${PACKAGE_EXT:-ipk}"
+            find . -name "*.${PACKAGE_EXT:-ipk}" 2>/dev/null | head -5 || echo "  ❌ Пакеты в ожидаемом формате не найдены"
             exit 1
           fi
 
@@ -254,22 +301,37 @@ jobs:
           set -e
           cd owrt
           
-          echo "=== 🎯 РАСШИРЕННЫЙ ПОИСК ПАКЕТОВ ==="
+          echo "=== 🎯 ИНТЕЛЛЕКТУАЛЬНЫЙ ПОИСК ПАКЕТОВ ==="
           mkdir -p ../artifacts
           
-          # Множественные стратегии поиска
-          declare -a search_strategies=(
-            "find . -name '*amneziawg*.ipk'"
-            "find . -name '*amneziawg*.apk'"
-            "find . -name '*awg*.ipk'"
-            "find . -name '*awg*.apk'"
-            "find . -name 'kmod-*wg*.ipk'"
-            "find . -name 'kmod-*wg*.apk'"
-            "find . -name 'luci-*amnezia*.ipk'"
-            "find . -name 'luci-*amnezia*.apk'"
-            "find . -name 'luci-proto-*wg*.ipk'"
-            "find . -name 'luci-proto-*wg*.apk'"
-          )
+          # Определяем ожидаемый формат из переменной окружения
+          expected_format="${PACKAGE_EXT:-ipk}"
+          echo "🎯 Ожидаемый формат пакетов: .$expected_format"
+          
+          # Адаптивные стратегии поиска на основе формата
+          if [ "$expected_format" = "apk" ]; then
+            declare -a search_strategies=(
+              "find . -name '*amneziawg*.apk'"
+              "find . -name '*awg*.apk'"
+              "find . -name 'kmod-*wg*.apk'"
+              "find . -name 'luci-*amnezia*.apk'"
+              "find . -name 'luci-proto-*wg*.apk'"
+              # Fallback к IPK на случай смешанной системы
+              "find . -name '*amneziawg*.ipk'"
+              "find . -name '*awg*.ipk'"
+            )
+          else
+            declare -a search_strategies=(
+              "find . -name '*amneziawg*.ipk'"
+              "find . -name '*awg*.ipk'"
+              "find . -name 'kmod-*wg*.ipk'"
+              "find . -name 'luci-*amnezia*.ipk'"
+              "find . -name 'luci-proto-*wg*.ipk'"
+              # Fallback к APK на случай неожиданного перехода
+              "find . -name '*amneziawg*.apk'"
+              "find . -name '*awg*.apk'"
+            )
+          fi
           
           declare -a search_locations=(
             "bin/targets"
@@ -343,7 +405,8 @@ jobs:
               if [ -f "$artifact" ]; then
                 size=$(stat -c%s "$artifact" || echo "unknown")
                 file_type=$(file -b "$artifact" 2>/dev/null || echo "unknown")
-                echo "  📦 $(basename "$artifact")"
+                pkg_ext="${artifact##*.}"
+                echo "  📦 $(basename "$artifact") [${pkg_ext}]"
                 echo "    📏 Размер: ${size} bytes"
                 echo "    🔍 Тип: ${file_type}"
               fi
@@ -355,8 +418,12 @@ jobs:
             echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Не найдено ни одного пакета!"
             echo ""
             echo "🩺 ДИАГНОСТИЧЕСКАЯ ИНФОРМАЦИЯ:"
-            echo "📋 Все .ipk и .apk файлы в системе сборки:"
-            find . \( -name "*.ipk" -o -name "*.apk" \) -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "Нет .ipk/.apk файлов"
+            echo "📋 Все пакетные файлы в системе сборки:"
+            find . \( -name "*.ipk" -o -name "*.apk" \) -type f -exec ls -lh {} \; 2>/dev/null | head -20 || echo "Нет пакетных файлов"
+            echo ""
+            echo "📋 Ожидаемый формат: .$expected_format"
+            echo "📋 Файлы в ожидаемом формате:"
+            find . -name "*.$expected_format" -type f 2>/dev/null | head -10 || echo "Нет файлов в формате .$expected_format"
             echo ""
             echo "📋 Файлы с 'amnezia' или 'awg' в имени:"
             find . -type f \( -name "*amnezia*" -o -name "*awg*" \) 2>/dev/null | head -20 || echo "Нет файлов с такими именами"
@@ -428,11 +495,12 @@ jobs:
           EOF
           
           if [ -d "artifacts" ] && [ "$(ls -A artifacts 2>/dev/null)" ]; then
-            for f in artifacts/*.ipk; do
+            for f in artifacts/*; do
               if [ -f "$f" ]; then
                 size=$(stat -c%s "$f" 2>/dev/null || echo "unknown")
                 size_mb=$(echo "scale=2; $size/1024/1024" | bc -l 2>/dev/null || echo "unknown")
-                echo "- 📦 \`$(basename "$f")\` (**${size_mb} MB** / ${size} bytes)"
+                pkg_ext="${f##*.}"
+                echo "- 📦 \`$(basename "$f")\` [**${pkg_ext}**] (**${size_mb} MB** / ${size} bytes)"
               fi
             done >> release_notes.md
           else
@@ -443,16 +511,22 @@ jobs:
           
           ## 📋 Техническая информация
           - **Целевая платформа**: GL.iNet ${{ env.gl_version }}
+          - **Формат пакетов**: ${{ env.PACKAGE_EXT || 'ipk' }}
           - **Дата сборки**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           - **OpenWRT ветка**: ${{ env.owr_branch }}
           - **OpenWRT commit**: ${{ env.owr_commit }}
           
           ## 🔧 Установка
           \`\`\`bash
-          # Загрузите файлы на роутер и установите через opkg
+          # Для IPK пакетов (традиционный способ):
           opkg install kmod-amneziawg_*.ipk
           opkg install amneziawg-tools_*.ipk
           opkg install luci-proto-amneziawg_*.ipk
+          
+          # Для APK пакетов (новый формат):
+          apk add kmod-amneziawg_*.apk
+          apk add amneziawg-tools_*.apk
+          apk add luci-proto-amneziawg_*.apk
           \`\`\`
           EOF
           
