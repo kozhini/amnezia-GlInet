@@ -116,21 +116,36 @@ jobs:
           echo "✅ $success / $total built."
           [ "$success" -gt 0 ] || exit 1
 
-      - name: Collect IPK artifacts
+      - name: Collect IPK Artifacts
+        shell: bash
         run: |
+          set -e
           cd owrt
           mkdir -p ../artifacts
-          for pattern in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
-            find bin/ -type f -name "${pattern}*.ipk" -print0 \
-              | xargs -0 -I{} cp {} ../artifacts/ && echo "✅ Copied ${pattern}.ipk"
+
+          declare -a patterns=("kmod-amneziawg" "amneziawg-tools" "luci-proto-amneziawg")
+          copied=0
+
+          for pattern in "${patterns[@]}"; do
+            matches=$(find bin/ -type f -name "${pattern}*.ipk")
+            if [[ -n "$matches" ]]; then
+              echo "$matches" | while IFS= read -r file; do
+                cp "$file" ../artifacts/
+                echo "✅ Copied $(basename "$file")"
+                copied=$((copied+1))
+              done
+            else
+              echo "⚠️ No .ipk found for pattern: $pattern"
+            fi
           done
-          count=$(ls -1 ../artifacts/*.ipk 2>/dev/null | wc -l)
-          if [ "$count" -eq 0 ]; then
-            echo "❌ No .ipk found"
+
+          if [[ "$copied" -eq 0 ]]; then
+            echo "❌ No .ipk found in total"
             find bin/ -type f -name "*.ipk"
             exit 1
           fi
-          echo "✅ Collected $count packages"
+
+          echo "✅ Collected $copied packages"
 
       - name: Extract kernel info
         id: kinfo
