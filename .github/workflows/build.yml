@@ -57,166 +57,124 @@ jobs:
             libssl-dev gettext zlib1g-dev swig unzip time rsync python3 python3-setuptools \
             python3-yaml
 
-      - name: Validate Configuration File
+      - name: Validate Config File
         run: |
           CONFIG_FILE="gl/config_${{ env.gl_version }}.buildinfo"
           if [ ! -f "$CONFIG_FILE" ]; then
-            echo "❌ Missing configuration: $CONFIG_FILE"
-            echo "Available configs:"
-            ls -la gl/config_*.buildinfo || echo "No config files found"
+            echo "❌ Missing config: $CONFIG_FILE"
+            ls -la gl/
             exit 1
           fi
-          echo "✅ Using $CONFIG_FILE"
+          echo "✅ Using config: $CONFIG_FILE"
 
-      - name: Prepare OpenWRT Build
+      - name: Prepare OpenWRT
         run: |
           cd owrt
           git reset --hard ${{ env.owr_commit }}
           mkdir -p package/awg
-          cp -a ../awg/. package/awg/
+          echo "📦 Copying AWG packages..."
+          cp -a ../awg/{kmod-amneziawg,amneziawg-tools,luci-proto-amneziawg} package/awg/
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
           cp ../gl/config_${{ env.gl_version }}.buildinfo .config
-
           cat >> .config <<EOF
-          CONFIG_PACKAGE_kmod-amneziawg=m
-          CONFIG_PACKAGE_amneziawg-tools=y
-          CONFIG_PACKAGE_luci-proto-amneziawg=y
-          EOF
-
+CONFIG_PACKAGE_kmod-amneziawg=m
+CONFIG_PACKAGE_amneziawg-tools=y
+CONFIG_PACKAGE_luci-proto-amneziawg=y
+EOF
           make defconfig
+          echo "🔍 Checking .config..."
+          grep -E 'amneziawg' .config || { echo "❌ .config missing amneziawg entries"; exit 1; }
 
-          # Override vermagic
           sed -i.bak '/\.vermagic/c\	echo "${{ env.gl_vermagic }}" > $(LINUX_DIR)/.vermagic' ./include/kernel-defaults.mk
 
-      - name: Build Kernel and Toolchain
+      - name: Build Kernel/Toolchain
         run: |
           cd owrt
           make tools/install -j$(nproc)
           make toolchain/install -j$(nproc)
           make target/linux/{clean,compile} -i -j$(nproc) V=s
 
-      - name: Build AmneziaWG Packages
+      - name: Build Packages
         run: |
           cd owrt
-          success=0
-          total=0
+          success=0; total=0
           for pkg in package/awg/*/; do
             [ -f "$pkg/Makefile" ] || continue
             pkgname=$(basename "$pkg")
-            echo "🔧 Building: $pkgname"
-            make package/awg/${pkgname}/clean V=s || true
-            make package/awg/${pkgname}/download V=s || true
-            make package/awg/${pkgname}/prepare V=s || true
-            make package/awg/${pkgname}/compile V=s && success=$((success+1))
+            echo "🔧 Building $pkgname"
+            make package/awg/$pkgname/{clean,download,prepare} V=s || true
+            if make package/awg/$pkgname/compile V=s; then
+              echo "✅ Built $pkgname"; success=$((success+1))
+            else
+              echo "❌ Failed $pkgname"
+            fi
             total=$((total+1))
           done
-          echo "✅ $success/$total packages built."
+          echo "✅ $success / $total built."
           [ "$success" -gt 0 ] || exit 1
 
-      - name: Collect Built Packages
+      - name: Collect IPK artifacts
         run: |
           cd owrt
           mkdir -p ../artifacts
-          packages_found=0
-          
           for pattern in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
-            files=$(find bin/ -name "${pattern}*.ipk" 2>/dev/null || true)
-            if [ -n "$files" ]; then
-              echo "$files" | while read -r file; do
-                [ -f "$file" ] || continue
-                cp "$file" ../artifacts/
-                echo "✅ Copied: $(basename "$file")"
-              done
-              packages_found=$((packages_found + 1))
-            else
-              echo "⚠️ Pattern $pattern not found"
-            fi
+            find bin/ -type f -name "${pattern}*.ipk" -print0 \
+              | xargs -0 -I{} cp {} ../artifacts/ && echo "✅ Copied ${pattern}.ipk"
           done
-          
-          # Проверяем что хотя бы один файл скопирован
-          actual_files=$(ls -1 ../artifacts/*.ipk 2>/dev/null | wc -l)
-          if [ "$actual_files" -eq 0 ]; then
-            echo "❌ No packages found to collect"
-            echo "Available files in bin/:"
-            find bin/ -name "*.ipk" -ls || echo "No .ipk files found"
+          count=$(ls -1 ../artifacts/*.ipk 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "❌ No .ipk found"
+            find bin/ -type f -name "*.ipk"
             exit 1
           fi
-          echo "✅ Collected $actual_files package(s)"
+          echo "✅ Collected $count packages"
 
       - name: Extract kernel info
         id: kinfo
         run: |
           cd owrt
-          # Добавляем таймаут ожидания файла
-          VERMAGIC_FILE=""
           for i in {1..30}; do
-            VERMAGIC_FILE=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
-            [ -n "$VERMAGIC_FILE" ] && [ -f "$VERMAGIC_FILE" ] && break
-            echo "Waiting for .vermagic file... ($i/30)"
+            file=$(find build_dir/target-*/linux-*/linux-*/.vermagic 2>/dev/null | head -n1)
+            [ -f "$file" ] && break
+            echo "Waiting .vermagic... ($i)"
             sleep 2
           done
-          
-          if [ ! -f "$VERMAGIC_FILE" ]; then
-            echo "❌ .vermagic not found after 60s timeout"
-            echo "Searching for .vermagic files:"
-            find build_dir/ -name ".vermagic" -ls 2>/dev/null || echo "No .vermagic files found"
-            exit 1
-          fi
-
-          # Считываем VERMAGIC
-          VERMAGIC_CONTENT=$(cat "$VERMAGIC_FILE")
-          echo "vermagic=$VERMAGIC_CONTENT" >> "$GITHUB_OUTPUT"
-
-          # Получаем версию ядра через make kernelversion
-          KERNEL_DIR=$(dirname "$VERMAGIC_FILE")
-          if [ -d "$KERNEL_DIR" ]; then
-            KERNEL_VERSION=$(make -s -C "$KERNEL_DIR" kernelversion 2>/dev/null || echo "unknown")
-          else
-            KERNEL_VERSION="unknown"
-          fi
-          echo "kernel_version=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
-          
-          echo "✅ Kernel: $KERNEL_VERSION, VERMAGIC: $VERMAGIC_CONTENT"
+          [ -f "$file" ] || { echo "❌ .vermagic not found"; find build_dir/ -name .vermagic; exit 1; }
+          vermagic=$(cat "$file"); echo "vermagic=$vermagic" >> "$GITHUB_OUTPUT"
+          kdir=$(dirname "$file")
+          kv=$(make -s -C "$kdir" kernelversion 2>/dev/null || echo unknown)
+          echo "kernel_version=$kv" >> "$GITHUB_OUTPUT"
+          echo "✅ Kernel: $kv, VERMAGIC: $vermagic"
 
       - name: Create release notes
         run: |
           cat > release_notes.md <<EOF
-          # AmneziaWG GL.iNet v${{ env.gl_version }}
-          
-          Built from OpenWRT ${{ env.owr_branch }} (commit: ${{ env.owr_commit }})
-          
-          ## Kernel Information
-          • **Version**: ${{ steps.kinfo.outputs.kernel_version }}
-          • **VERMAGIC**: ${{ steps.kinfo.outputs.vermagic }}
-          
-          ## Package Contents
-          EOF
-          
-          if [ -d artifacts ] && [ "$(ls -A artifacts/ 2>/dev/null)" ]; then
-            for f in artifacts/*.ipk; do
-              [ -f "$f" ] || continue
-              name=$(basename "$f")
-              size=$(stat -c%s "$f" 2>/dev/null || echo "unknown")
-              echo "• \`$name\` ($size bytes)" >> release_notes.md
-            done
-          else
-            echo "⚠️ No packages found in artifacts/" >> release_notes.md
-          fi
-          
-          echo ""
-          echo "Generated release notes:"
+# AmneziaWG GL.iNet v${{ env.gl_version }}
+
+Built from OpenWRT ${{ env.owr_branch }} (commit ${{ env.owr_commit }})
+
+## Kernel Info
+- Version: ${{ steps.kinfo.outputs.kernel_version }}
+- VERMAGIC: ${{ steps.kinfo.outputs.vermagic }}
+
+## Packages:
+EOF
+          for f in artifacts/*.ipk; do
+            size=$(stat -c%s "$f" || echo unknown)
+            echo "- \`$(basename "$f")\` ($size bytes)"
+          done >> release_notes.md
           cat release_notes.md
 
-      - name: Upload Packages as Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: amneziawg-packages-${{ env.gl_version }}
           path: artifacts/*.ipk
 
-      - name: Auto-Publish Release
+      - name: Auto-publish release
         if: startsWith(github.ref, 'refs/tags/') && hashFiles('artifacts/*.ipk') != ''
         uses: softprops/action-gh-release@v2
         with:
