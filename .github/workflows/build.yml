@@ -80,10 +80,10 @@ jobs:
 
           cp ../gl/config_${{ env.gl_version }}.buildinfo .config
           cat >> .config <<EOF
-CONFIG_PACKAGE_kmod-amneziawg=m
-CONFIG_PACKAGE_amneziawg-tools=y
-CONFIG_PACKAGE_luci-proto-amneziawg=y
-EOF
+          CONFIG_PACKAGE_kmod-amneziawg=m
+          CONFIG_PACKAGE_amneziawg-tools=y
+          CONFIG_PACKAGE_luci-proto-amneziawg=y
+          EOF
           make defconfig
           echo "🔍 Checking .config..."
           grep -E 'amneziawg' .config || { echo "❌ .config missing amneziawg entries"; exit 1; }
