@@ -1,3 +1,6 @@
+CONFIG_USE_APK=y
+CONFIG_PACKAGE_apk-mbedtls=y
+
 CONFIG_TARGET_mediatek=y
 CONFIG_TARGET_mediatek_filogic=y
 CONFIG_TARGET_mediatek_filogic_DEVICE_glinet_gl-mt6000=y
