@@ -1,4 +1,3 @@
-
 name: Build & Publish AmneziaWG Packages
 
 on:
@@ -469,22 +468,28 @@ jobs:
           )
           
           copied=0
-          found_files=()
           
           echo "🔍 Стратегия 1: Поиск по паттернам имен"
           for strategy in "${search_strategies[@]}"; do
             echo "  🔎 Выполняем: $strategy"
-            results=$(eval "$strategy" 2>/dev/null | head -10)
-            if [ -n "$results" ]; then
-              echo "$results" | while IFS= read -r file; do
+            # Используем временный файл для сохранения результатов find
+            temp_results=$(mktemp)
+            eval "$strategy" 2>/dev/null | head -10 > "$temp_results" || true
+            
+            if [ -s "$temp_results" ]; then
+              while IFS= read -r file; do
                 if [ -f "$file" ] && [ ! -f "../artifacts/$(basename "$file")" ]; then
-                  cp "$file" ../artifacts/
-                  size=$(stat -c%s "$file" || echo "unknown")
-                  echo "    ✅ Скопирован: $(basename "$file") (${size} bytes)"
-                  copied=$((copied+1))
+                  if cp "$file" ../artifacts/ 2>/dev/null; then
+                    size=$(stat -c%s "$file" 2>/dev/null || echo "unknown")
+                    echo "    ✅ Скопирован: $(basename "$file") (${size} bytes)"
+                    copied=$((copied+1))
+                  else
+                    echo "    ⚠️ Не удалось скопировать: $(basename "$file")"
+                  fi
                 fi
-              done
+              done < "$temp_results"
             fi
+            rm -f "$temp_results"
           done
           
           echo ""
@@ -492,36 +497,53 @@ jobs:
           for location in "${search_locations[@]}"; do
             if [ -d "$location" ]; then
               echo "  📁 Сканируем: $location"
-              location_files=$(find "$location" -maxdepth 4 \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null | grep -iE "(amnezia|awg)" | head -5)
-              if [ -n "$location_files" ]; then
-                echo "$location_files" | while IFS= read -r file; do
+              # Создаем временный файл для результатов поиска
+              temp_location_files=$(mktemp)
+              find "$location" -maxdepth 4 \( -name "*.ipk" -o -name "*.apk" \) 2>/dev/null | grep -iE "(amnezia|awg)" | head -5 > "$temp_location_files" || true
+              
+              if [ -s "$temp_location_files" ]; then
+                while IFS= read -r file; do
                   if [ -f "$file" ] && [ ! -f "../artifacts/$(basename "$file")" ]; then
-                    cp "$file" ../artifacts/
-                    size=$(stat -c%s "$file" || echo "unknown")
-                    echo "    ✅ Из $location: $(basename "$file") (${size} bytes)"
-                    copied=$((copied+1))
+                    if cp "$file" ../artifacts/ 2>/dev/null; then
+                      size=$(stat -c%s "$file" 2>/dev/null || echo "unknown")
+                      echo "    ✅ Из $location: $(basename "$file") (${size} bytes)"
+                      copied=$((copied+1))
+                    else
+                      echo "    ⚠️ Не удалось скопировать из $location: $(basename "$file")"
+                    fi
                   fi
-                done
+                done < "$temp_location_files"
               else
                 echo "    ⚪ В $location пакеты не найдены"
               fi
+              rm -f "$temp_location_files"
+            else
+              echo "  ⚪ Директория $location не существует"
             fi
           done
           
           echo ""
           echo "🔍 Стратегия 3: Поиск по времени модификации (последние 2 часа)"
-          recent_files=$(find . \( -name "*.ipk" -o -name "*.apk" \) -type f -mmin -120 2>/dev/null | grep -iE "(amnezia|awg)" | head -10)
-          if [ -n "$recent_files" ]; then
+          temp_recent_files=$(mktemp)
+          find . \( -name "*.ipk" -o -name "*.apk" \) -type f -mmin -120 2>/dev/null | grep -iE "(amnezia|awg)" | head -10 > "$temp_recent_files" || true
+          
+          if [ -s "$temp_recent_files" ]; then
             echo "  📅 Недавно созданные пакетные файлы:"
-            echo "$recent_files" | while IFS= read -r file; do
+            while IFS= read -r file; do
               if [ ! -f "../artifacts/$(basename "$file")" ]; then
-                cp "$file" ../artifacts/ 2>/dev/null || true
-                size=$(stat -c%s "$file" || echo "unknown")
-                echo "    ✅ Недавний: $(basename "$file") (${size} bytes)"
-                copied=$((copied+1))
+                if cp "$file" ../artifacts/ 2>/dev/null; then
+                  size=$(stat -c%s "$file" 2>/dev/null || echo "unknown")
+                  echo "    ✅ Недавний: $(basename "$file") (${size} bytes)"
+                  copied=$((copied+1))
+                else
+                  echo "    ⚠️ Не удалось скопировать недавний файл: $(basename "$file")"
+                fi
               fi
-            done
+            done < "$temp_recent_files"
+          else
+            echo "  ⚪ Недавние пакетные файлы не найдены"
           fi
+          rm -f "$temp_recent_files"
           
           echo ""
           echo "📊 ============ РЕЗУЛЬТАТ СБОРА ============"
@@ -530,7 +552,7 @@ jobs:
             echo "✅ Найденные артефакты:"
             for artifact in ../artifacts/*; do
               if [ -f "$artifact" ]; then
-                size=$(stat -c%s "$artifact" || echo "unknown")
+                size=$(stat -c%s "$artifact" 2>/dev/null || echo "unknown")
                 file_type=$(file -b "$artifact" 2>/dev/null || echo "unknown")
                 pkg_ext="${artifact##*.}"
                 echo "  📦 $(basename "$artifact") [${pkg_ext}]"
@@ -538,9 +560,10 @@ jobs:
                 echo "    🔍 Тип: ${file_type}"
               fi
             done
-            copied=$(ls -1 ../artifacts | wc -l)
+            # Подсчитываем финальное количество файлов
+            final_count=$(ls -1 ../artifacts 2>/dev/null | wc -l)
             echo ""
-            echo "✅ Общий итог: собрано $copied пакетов"
+            echo "✅ Общий итог: собрано $final_count пакетов"
           else
             echo "❌ КРИТИЧЕСКАЯ ОШИБКА: Не найдено ни одного пакета!"
             echo ""
@@ -559,7 +582,7 @@ jobs:
             for dir in bin staging_dir build_dir; do
               if [ -d "$dir" ]; then
                 echo "  📁 $dir (первые 10 файлов):"
-                find "$dir" -type f 2>/dev/null | head -10 | sed 's/^/    /'
+                find "$dir" -type f 2>/dev/null | head -10 | sed 's/^/    /' || true
               fi
             done
             exit 1
