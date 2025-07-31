@@ -20,7 +20,7 @@ permissions:
   contents: write
 
 env:
-  owr_branch: "openwrt-24.10"
+  owr_branch: "v24.10.2"
   owr_commit: "cb1b656027"
   gl_version: ${{ inputs.gl_version || 'MT6000_4.8.0' }}
   gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
