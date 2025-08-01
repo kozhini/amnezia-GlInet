@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       gl_version:
-        description: 'GL.iNet ImmortalWRT version AmneziaWG'
+        description: 'GL.iNet version AmneziaWG'
         required: false
         type: string
       force_rebuild:
@@ -15,15 +15,24 @@ on:
         required: false
         type: boolean
         default: false
+      package_format:
+        description: 'Package format (auto/ipk/apk)'
+        required: false
+        type: choice
+        options:
+          - auto
+          - ipk
+          - apk
+        default: auto
 
 permissions:
   contents: write
 
 env:
   owr_branch: "v24.10.2"
-  owr_commit: "a878dd24e7"
+  owr_commit: "cb1b656027"
   gl_version: ${{ inputs.gl_version || 'MT6000_4.8.0' }}
-  gl_vermagic: "2ccac7a75355327cb6dfb4df1ecb575e"
+  gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
 
 jobs:
   build:
@@ -104,43 +113,84 @@ jobs:
       - name: Check Package Manager Type
         run: |
           cd owrt
-          echo "🔍 Проверка типа пакетного менеджера..."
+          echo "🔍 Определение типа пакетного менеджера..."
           
-          # Проверяем конфигурацию на APK
-          if grep -q "CONFIG_USE_APK" .config 2>/dev/null; then
-            echo "📦 Система настроена на APK пакеты"
-            echo "package_format=apk" >> $GITHUB_ENV
-            echo "PACKAGE_EXT=apk" >> $GITHUB_ENV
-          else
-            echo "📦 Система настроена на IPK пакеты (по умолчанию)"
+          # Получаем пользовательский выбор
+          user_format="${{ inputs.package_format || 'auto' }}"
+          echo "👤 Пользовательский выбор формата: $user_format"
+          
+          # Определяем формат на основе выбора пользователя
+          if [ "$user_format" = "ipk" ]; then
+            echo "🎯 Принудительное использование IPK формата"
+            # Отключаем APK
+            sed -i '/CONFIG_USE_APK/d' .config
+            echo "# CONFIG_USE_APK is not set" >> .config
+            echo "CONFIG_PACKAGE_opkg=y" >> .config
+            make defconfig
             echo "package_format=ipk" >> $GITHUB_ENV
             echo "PACKAGE_EXT=ipk" >> $GITHUB_ENV
+            
+          elif [ "$user_format" = "apk" ]; then
+            echo "🎯 Принудительное использование APK формата"
+            # Включаем APK
+            sed -i '/CONFIG_USE_APK/d' .config
+            sed -i '/# CONFIG_USE_APK is not set/d' .config
+            echo "CONFIG_USE_APK=y" >> .config
+            make defconfig
+            echo "package_format=apk" >> $GITHUB_ENV
+            echo "PACKAGE_EXT=apk" >> $GITHUB_ENV
+            
+          else
+            echo "🔍 Автоматическое определение формата (режим auto)"
+            # Проверяем конфигурацию на APK
+            if grep -q "CONFIG_USE_APK=y" .config 2>/dev/null; then
+              echo "📦 Система настроена на APK пакеты"
+              echo "package_format=apk" >> $GITHUB_ENV
+              echo "PACKAGE_EXT=apk" >> $GITHUB_ENV
+            else
+              echo "📦 Система настроена на IPK пакеты (по умолчанию)"
+              echo "package_format=ipk" >> $GITHUB_ENV
+              echo "PACKAGE_EXT=ipk" >> $GITHUB_ENV
+            fi
           fi
           
-          echo "🔍 Анализ настроек пакетного менеджера:"
-          echo "  📋 APK-related конфигурация:"
-          grep -iE "apk" .config | head -5 || echo "    Нет APK настроек"
+          echo ""
+          echo "🔍 Анализ финальных настроек пакетного менеджера:"
+          echo "  📋 APK конфигурация:"
+          grep -iE "(CONFIG_USE_APK|apk)" .config | head -5 || echo "    Нет APK настроек"
           
-          echo "  📋 OPKG-related конфигурация:"
-          grep -iE "opkg" .config | head -5 || echo "    Нет OPKG настроек"
-          
-          echo "  📋 Package manager настройки:"
-          grep -iE "(package.*manager|CONFIG_USE_)" .config | head -5 || echo "    Стандартные настройки"
+          echo "  📋 OPKG конфигурация:"
+          grep -iE "(CONFIG_PACKAGE_opkg|opkg)" .config | head -5 || echo "    Нет OPKG настроек"
           
           echo "🔍 Проверка версии OpenWRT и коммита:"
           echo "  📅 Ветка: ${{ env.owr_branch }}"
           echo "  🔗 Коммит: ${{ env.owr_commit }}"
           
-          # Проверяем дату коммита для понимания, когда был переход
+          # Проверяем дату коммита для понимания поддержки APK
           commit_date=$(git show -s --format=%ci ${{ env.owr_commit }} 2>/dev/null || echo "unknown")
           echo "  📅 Дата коммита: $commit_date"
           
-          # Проверяем наличие APK утилит в системе сборки
+          # Проверяем наличие пакетных менеджеров в системе сборки
           echo "🔍 Доступные пакетные менеджеры в сборочной системе:"
-          which apk 2>/dev/null && echo "  ✅ APK доступен" || echo "  ❌ APK недоступен"
-          which opkg 2>/dev/null && echo "  ✅ OPKG доступен" || echo "  ❌ OPKG недоступен"
+          which apk 2>/dev/null && echo "  ✅ APK утилиты доступны" || echo "  ❌ APK утилиты недоступны"
+          which opkg 2>/dev/null && echo "  ✅ OPKG утилиты доступны" || echo "  ❌ OPKG утилиты недоступны"
           
-          echo "🎯 Итоговый формат пакетов: ${{ env.PACKAGE_EXT || 'ipk' }}"
+          final_format="${PACKAGE_EXT:-ipk}"
+          echo ""
+          echo "🎯 ============ ФИНАЛЬНЫЕ НАСТРОЙКИ ============"
+          echo "📦 Выбранный формат пакетов: .$final_format"
+          echo "👤 Источник выбора: $user_format"
+          
+          # Предупреждения и рекомендации
+          if [ "$user_format" = "apk" ] && ! grep -q "CONFIG_USE_APK=y" .config; then
+            echo "⚠️ ВНИМАНИЕ: Запрошен APK формат, но система не поддерживает APK"
+            echo "💡 Рекомендация: используйте более новую версию OpenWRT или переключитесь на IPK"
+          fi
+          
+          if [ "$user_format" = "ipk" ] && grep -q "CONFIG_USE_APK=y" .config; then
+            echo "ℹ️ ИНФОРМАЦИЯ: Запрошен IPK формат для системы с поддержкой APK"
+            echo "✅ Успешно переключено на IPK"
+          fi
 
       - name: Fix Package Versions for APK Compatibility
         run: |
@@ -632,6 +682,10 @@ jobs:
         run: |
           echo "📝 Создание release notes..."
           
+          # Определяем источник выбора формата
+          user_format="${{ inputs.package_format || 'auto' }}"
+          final_format="${PACKAGE_EXT:-ipk}"
+          
           cat > release_notes.md <<EOF
           # 🚀 AmneziaWG GL.iNet v${{ env.gl_version }}
           
@@ -661,23 +715,52 @@ jobs:
           
           ## 📋 Техническая информация
           - **Целевая платформа**: GL.iNet ${{ env.gl_version }}
-          - **Формат пакетов**: ${{ env.PACKAGE_EXT || 'ipk' }}
+          - **Формат пакетов**: **${final_format}** (выбор: ${user_format})
           - **Дата сборки**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           - **OpenWRT ветка**: ${{ env.owr_branch }}
           - **OpenWRT commit**: ${{ env.owr_commit }}
           
           ## 🔧 Установка
-          \`\`\`bash
-          # Для IPK пакетов (традиционный способ):
-          opkg install kmod-amneziawg_*.ipk
-          opkg install amneziawg-tools_*.ipk
-          opkg install luci-proto-amneziawg_*.ipk
+          EOF
           
-          # Для APK пакетов (новый формат):
-          apk add kmod-amneziawg_*.apk
-          apk add amneziawg-tools_*.apk
-          apk add luci-proto-amneziawg_*.apk
+          if [ "$final_format" = "apk" ]; then
+            cat >> release_notes.md <<EOF
+          \`\`\`bash
+          # Установка APK пакетов:
+          apk add kmod-amneziawg-*.apk
+          apk add amneziawg-tools-*.apk
+          apk add luci-proto-amneziawg-*.apk
           \`\`\`
+          
+          > **Примечание**: Данные пакеты собраны в формате APK для новых версий OpenWRT.
+          EOF
+          elif [ "$final_format" = "ipk" ]; then
+            cat >> release_notes.md <<EOF
+          \`\`\`bash
+          # Установка IPK пакетов:
+          opkg install kmod-amneziawg-*.ipk
+          opkg install amneziawg-tools-*.ipk
+          opkg install luci-proto-amneziawg-*.ipk
+          \`\`\`
+          
+          > **Примечание**: Данные пакеты собраны в традиционном формате IPK.
+          EOF
+          fi
+          
+          cat >> release_notes.md <<EOF
+          
+          ## ⚙️ Информация о сборке
+          - **Выбор формата**: \`${user_format}\`
+            - \`auto\` - автоматическое определение на основе конфигурации OpenWRT
+            - \`ipk\` - принудительное использование традиционного формата IPK
+            - \`apk\` - принудительное использование нового формата APK
+          - **Результирующий формат**: \`${final_format}\`
+          
+          ## 🔄 Переключение форматов
+          При ручном запуске workflow вы можете выбрать желаемый формат пакетов:
+          1. Перейдите в **Actions** → **Build & Publish AmneziaWG Packages**
+          2. Нажмите **Run workflow**
+          3. Выберите нужный формат в поле **Package format**
           EOF
           
           echo "📄 Предварительный просмотр release notes:"
