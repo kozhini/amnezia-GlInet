@@ -1,29 +1,37 @@
 name: Build & Publish AmneziaWG Packages
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  # Убираем автоматический запуск по тегам - только ручной запуск
   workflow_dispatch:
     inputs:
+      version_tag:
+        description: 'Version tag (e.g., v1.0.0) - will create tag if not exists'
+        required: true
+        type: string
       gl_version:
         description: 'GL.iNet ImmortalWRT version AmneziaWG'
         required: false
         type: string
+        default: 'MT6000_4.8.0'
       force_rebuild:
         description: 'Force rebuild even if packages exist'
         required: false
         type: boolean
         default: false
       package_format:
-        description: 'Package format (auto/ipk/apk)'
-        required: false
+        description: 'Package format'
+        required: true
         type: choice
         options:
           - auto
           - ipk
           - apk
         default: auto
+      create_release:
+        description: 'Create GitHub release after build'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -33,10 +41,43 @@ env:
   owr_commit: "a878dd24e7"
   gl_version: ${{ inputs.gl_version || 'MT6000_4.8.0' }}
   gl_vermagic: "2ccac7a75355327cb6dfb4df1ecb575e"
+  version_tag: ${{ inputs.version_tag }}
 
 jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.validation.outputs.proceed }}
+      clean_tag: ${{ steps.validation.outputs.clean_tag }}
+    steps:
+      - name: Validate Inputs
+        id: validation
+        run: |
+          echo "🔍 Валидация входных параметров..."
+          
+          # Проверяем формат тега
+          if [[ ! "${{ inputs.version_tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9\-\.]+)?$ ]]; then
+            echo "❌ Некорректный формат тега: ${{ inputs.version_tag }}"
+            echo "✅ Правильный формат: v1.0.0, v1.2.3-beta1, v2.0.0-rc.1"
+            exit 1
+          fi
+          
+          # Очищаем тег от префикса v для использования в именах файлов
+          clean_tag="${{ inputs.version_tag }}"
+          clean_tag="${clean_tag#v}"
+          echo "clean_tag=$clean_tag" >> $GITHUB_OUTPUT
+          
+          echo "✅ Входные параметры валидны"
+          echo "  📌 Тег: ${{ inputs.version_tag }}"
+          echo "  🎯 GL.iNet версия: ${{ inputs.gl_version }}"
+          echo "  📦 Формат пакетов: ${{ inputs.package_format }}"
+          echo "  🚀 Создать релиз: ${{ inputs.create_release }}"
+          echo "proceed=true" >> $GITHUB_OUTPUT
+
   build:
     runs-on: ubuntu-latest
+    needs: validate-inputs
+    if: needs.validate-inputs.outputs.proceed == 'true'
     timeout-minutes: 180
 
     steps:
@@ -116,7 +157,7 @@ jobs:
           echo "🔍 Определение типа пакетного менеджера..."
           
           # Получаем пользовательский выбор
-          user_format="${{ inputs.package_format || 'auto' }}"
+          user_format="${{ inputs.package_format }}"
           echo "👤 Пользовательский выбор формата: $user_format"
           
           # Определяем формат на основе выбора пользователя
@@ -518,6 +559,7 @@ jobs:
           )
           
           copied=0
+          
           
           echo "🔍 Стратегия 1: Поиск по паттернам имен"
           for strategy in "${search_strategies[@]}"; do
