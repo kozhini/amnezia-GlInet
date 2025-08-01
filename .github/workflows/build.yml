@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       gl_version:
-        description: 'GL.iNet version AmneziaWG'
+        description: 'GL.iNet ImmortalWRT version AmneziaWG'
         required: false
         type: string
       force_rebuild:
@@ -21,9 +21,9 @@ permissions:
 
 env:
   owr_branch: "v24.10.2"
-  owr_commit: "cb1b656027"
+  owr_commit: "a878dd24e7"
   gl_version: ${{ inputs.gl_version || 'MT6000_4.8.0' }}
-  gl_vermagic: "9469a6c8c449c47e503c05678ea1559d"
+  gl_vermagic: "2ccac7a75355327cb6dfb4df1ecb575e"
 
 jobs:
   build:
